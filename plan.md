@@ -84,4 +84,10 @@ aggregate ─► user_daily / campaign_daily ─► Parquet (day = DATE)
 | v1 | Correct parallel baseline: 36/36 fixtures, dev MATCH | ~160 ms (1M, warm) | 4.5 s |
 | v2d `f7422a3` | u128 keys, bucketed dedup + winner bitmap, AVX2 scanner, prefetched link table, memory reuse | 20M: ~1.8 s (slow state) | ? |
 | v2h `0a4ff68` | exact 64-bit order-preserving ID keys, sharded parallel link interning, day table, 256 dedup buckets | 20M: ~0.75 s (quiet) | |
-| v2m `2fbfd74` | hand-rolled Parquet writer, write-combining scatter, background unmapping | 20M: ~0.7 s (quiet); 60M: ~4.5 s, 10 GB peak | |
+| v2m `2fbfd74` | hand-rolled Parquet writer, write-combining scatter, background unmapping | 20M: ~0.7 s (quiet); 60M: ~4.5 s, 10 GB peak | 1.68 s |
+| v3f `75776cb` | per-line quote check in scanner; huge-page allocator (mmap'd big blocks, bump arena) | 20M: ~0.65-0.78 s | |
+| v3g `a61d6db` | pread into reused per-thread buffers instead of mmap; click ids as packed keys | 20M: ~0.65-0.72 s; 60M: ~2.4 s, 5.8 GB peak | |
+| v3h `9d4d511` | 16-byte event records (purchases on a side list), bucket sizes from sampled line density | 20M: ~0.65 s, 1.7 GB peak; 60M: 4.8 GB peak | |
+| v3l `7078250` | links built on a separate 2-thread pool while parsing (records held back until ready) | ~5-7% under v3h | |
+
+Notes from v3 work: v1 used 24 CPU-s and scored 4.5 s (local 4.24 s), so scorer cores are about as fast as local ones for compute; v2m's 1.68 s against ~0.7-1.0 s locally points at something environment-specific (file mapping / page faults / cold cache). Tried and dropped: resolving links per user-id bucket after parsing (v3d/e, slower), Bloom filter in front of the link table, non-temporal scatter stores (no gain).
