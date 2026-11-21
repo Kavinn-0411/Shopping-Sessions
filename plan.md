@@ -73,8 +73,15 @@ aggregate ─► user_daily / campaign_daily ─► Parquet (day = DATE)
 - After that, submit only builds that passed the differential tests. Keep a log of commit → practice time.
 - The final commit is the fastest build that passed every check, with comfortable memory headroom at 60M.
 
+## Verification set (every build)
+
+36 fixtures, dev answer, seeds 1-6 at 1M, two weird-ID stress sets (`scripts/weird.py`: long/odd IDs that force the hashed-key path), 20M and 60M, all diffed against the frozen v1 outputs (`scripts/bench.sh` with `REF=v1`). Parquet also validated with pyarrow and DuckDB.
+
 ## Log
 
 | Commit | Change | Local dev time | Practice time |
 | --- | --- | --- | --- |
-| v1 | Correct parallel baseline: 36/36 fixtures, dev MATCH | ~160 ms (1M, warm) | |
+| v1 | Correct parallel baseline: 36/36 fixtures, dev MATCH | ~160 ms (1M, warm) | 4.5 s |
+| v2d `f7422a3` | u128 keys, bucketed dedup + winner bitmap, AVX2 scanner, prefetched link table, memory reuse | 20M: ~1.8 s (slow state) | ? |
+| v2h `0a4ff68` | exact 64-bit order-preserving ID keys, sharded parallel link interning, day table, 256 dedup buckets | 20M: ~0.75 s (quiet) | |
+| v2m `2fbfd74` | hand-rolled Parquet writer, write-combining scatter, background unmapping | 20M: ~0.7 s (quiet); 60M: ~4.5 s, 10 GB peak | |
