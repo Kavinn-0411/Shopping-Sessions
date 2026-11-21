@@ -218,10 +218,10 @@ fn map_file(p: &Path) -> Res<B> {
     if f.metadata()?.len() == 0 {
         return Ok(&[]);
     }
-    let m = if std::env::var_os("NOPOP").is_some() {
-        unsafe { Mmap::map(&f)? }
-    } else {
+    let m = if std::env::var_os("NOPOP").is_none() {
         unsafe { memmap2::MmapOptions::new().populate().map(&f)? }
+    } else {
+        unsafe { Mmap::map(&f)? }
     };
     let m: &'static Mmap = Box::leak(Box::new(m));
     Ok(&m[..])
@@ -230,6 +230,20 @@ fn map_file(p: &Path) -> Res<B> {
 fn map_dir(dir: &Path) -> Res<Vec<B>> {
     let paths = list_csv(dir);
     paths.par_iter().map(|p| map_file(p)).collect()
+}
+
+/// Map the chunk's pages up front (MADV_POPULATE_READ, Linux 5.14+); errors are ignored.
+fn populate(d: &[u8]) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if std::env::var_os("NOMADV").is_some() || d.is_empty() {
+            return;
+        }
+        let page = 4096usize;
+        let start = (d.as_ptr() as usize) & !(page - 1);
+        let end = d.as_ptr() as usize + d.len();
+        libc::madvise(start as *mut libc::c_void, end - start, 22 /* MADV_POPULATE_READ */);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -680,98 +694,179 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
-/// Returns the id-key -> person-key map and long person names.
+/// Byte-wise order of two ID keys; long keys are compared through their bytes.
+#[inline]
+fn key_lt(a: u128, b: u128, long: &FxHashMap<u128, B>) -> bool {
+    if !is_long(a) && !is_long(b) {
+        a < b
+    } else {
+        let sa: &[u8] = if is_long(a) { long[&a] } else { &[] };
+        let sb: &[u8] = if is_long(b) { long[&b] } else { &[] };
+        let ba;
+        let bb;
+        let x: &[u8] = if is_long(a) {
+            sa
+        } else {
+            ba = a.to_be_bytes();
+            &ba[..ba[15] as usize]
+        };
+        let y: &[u8] = if is_long(b) {
+            sb
+        } else {
+            bb = b.to_be_bytes();
+            &bb[..bb[15] as usize]
+        };
+        x < y
+    }
+}
+
+#[inline]
+fn shard_of(k: u128) -> usize {
+    (mix(k) >> (64 - SBITS)) as usize
+}
+
+/// Returns the id-key -> person-key map and the bytes of long person names.
 fn build_links(data: &Path, ncpu: usize) -> Res<(LinkMap, Vec<(u128, B)>)> {
+    let tl = Instant::now();
     let files = map_dir(&data.join("links"))?;
     let chunks = make_chunks(&files, chunk_target(&files, ncpu).min(4 << 20));
-    let pairs: Vec<Vec<(B, B)>> = chunks
+    // parse straight into key pairs; long ids keep their bytes on the side
+    let parsed: Vec<(Vec<(u128, u128)>, Vec<(u128, B)>)> = chunks
         .par_iter()
         .map(|c| {
-            let mut v = Vec::new();
-            let mut f: [B; 2] = [&[]; 2];
-            for_each_line(c, |line| {
-                if split(line, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
-                    v.push((f[0], f[1]));
+            let limit = c.data.as_ptr() as usize + c.data.len();
+            let mut edges = Vec::with_capacity(c.data.len() / 20);
+            let mut long = Vec::new();
+            scan::<2>(c, |f| {
+                if f[0].is_empty() || f[1].is_empty() {
+                    return;
                 }
+                let a = key_fast(f[0], limit);
+                let b = key_fast(f[1], limit);
+                if is_long(a) {
+                    long.push((a, f[0]));
+                }
+                if is_long(b) {
+                    long.push((b, f[1]));
+                }
+                edges.push((a, b));
             });
-            v
+            (edges, long)
         })
         .collect();
-    let tl = Instant::now();
-    let edges: Vec<(B, B)> = pairs.into_iter().flatten().collect();
-    let ne = edges.len();
-    // Intern by sorting (key, bytes, slot) in byte order; ids come out in byte order.
-    let mut items: Vec<(u128, B, u32)> = edges
-        .par_iter()
-        .enumerate()
-        .flat_map_iter(|(e, &(a, b))| {
-            [(key_of(a), a, 2 * e as u32), (key_of(b), b, 2 * e as u32 + 1)]
-        })
-        .collect();
-    let cmp = |x: &(u128, B, u32), y: &(u128, B, u32)| {
-        if !is_long(x.0) && !is_long(y.0) {
-            x.0.cmp(&y.0)
-        } else {
-            x.1.cmp(y.1)
-        }
-    };
-    items.par_sort_unstable_by(cmp);
-    let mut slot_id = vec![0u32; 2 * ne];
-    let mut names: Vec<(u128, B)> = Vec::new();
-    for (i, it) in items.iter().enumerate() {
-        let new = i == 0 || {
-            let p = &items[i - 1];
-            if !is_long(p.0) && !is_long(it.0) {
-                p.0 != it.0
-            } else {
-                p.1 != it.1
-            }
-        };
-        if new {
-            names.push((it.0, it.1));
-        }
-        slot_id[it.2 as usize] = (names.len() - 1) as u32;
+    let mut long: FxHashMap<u128, B> = FxHashMap::default();
+    for (_, l) in &parsed {
+        long.extend(l.iter().copied());
     }
-    drop(items);
-    eprintln!("  links: parsed+interned {} edges in {:?} (since flatten)", ne, tl.elapsed());
-    let n = names.len();
+    eprintln!("  links: parse {:?}", tl.elapsed());
+
+    // global edge numbering
+    let mut base = Vec::with_capacity(parsed.len());
+    let mut ne = 0usize;
+    for (e, _) in &parsed {
+        base.push(ne);
+        ne += e.len();
+    }
+    // scatter endpoints (key, slot) by shard
+    let scattered: Vec<Vec<Vec<(u128, u32)>>> = parsed
+        .par_iter()
+        .zip(base.par_iter())
+        .map(|((edges, _), &b0)| {
+            let mut out: Vec<Vec<(u128, u32)>> = (0..NS).map(|_| Vec::with_capacity(edges.len() * 2 / NS + 8)).collect();
+            for (i, &(a, b)) in edges.iter().enumerate() {
+                let slot = 2 * (b0 + i) as u32;
+                out[shard_of(a)].push((a, slot));
+                out[shard_of(b)].push((b, slot + 1));
+            }
+            out
+        })
+        .collect();
+    // intern per shard: local ids and the shard's key list
+    let interned: Vec<(Vec<u128>, Vec<(u32, u32)>)> = (0..NS)
+        .into_par_iter()
+        .map(|s| {
+            let total: usize = scattered.iter().map(|v| v[s].len()).sum();
+            let mut m: FxHashMap<u128, u32> = FxHashMap::default();
+            m.reserve(total);
+            let mut keys = Vec::new();
+            let mut slots = Vec::with_capacity(total);
+            for v in &scattered {
+                for &(k, slot) in &v[s] {
+                    let id = *m.entry(k).or_insert_with(|| {
+                        keys.push(k);
+                        (keys.len() - 1) as u32
+                    });
+                    slots.push((slot, id));
+                }
+            }
+            (keys, slots)
+        })
+        .collect();
+    drop(scattered);
+    let mut sbase = vec![0u32; NS + 1];
+    for s in 0..NS {
+        sbase[s + 1] = sbase[s] + interned[s].0.len() as u32;
+    }
+    let n = sbase[NS] as usize;
+    let mut names: Vec<u128> = Vec::with_capacity(n);
+    for (keys, _) in &interned {
+        names.extend_from_slice(keys);
+    }
+    let mut slot_id = vec![0u32; 2 * ne];
+    for (s, (_, slots)) in interned.iter().enumerate() {
+        for &(slot, id) in slots {
+            slot_id[slot as usize] = sbase[s] + id;
+        }
+    }
+    eprintln!("  links: intern {} edges, {} ids {:?}", ne, n, tl.elapsed());
+
+    // union-find; a root is always the byte-wise smallest name of its set
     let mut parent: Vec<u32> = (0..n as u32).collect();
     for e in 0..ne {
         let ra = find(&mut parent, slot_id[2 * e]);
         let rb = find(&mut parent, slot_id[2 * e + 1]);
         if ra != rb {
-            // The smaller id is the byte-wise smaller name: it becomes the root.
-            parent[ra.max(rb) as usize] = ra.min(rb);
+            if key_lt(names[rb as usize], names[ra as usize], &long) {
+                parent[ra as usize] = rb;
+            } else {
+                parent[rb as usize] = ra;
+            }
         }
     }
-    let mut by_shard: Vec<Vec<(u128, u128)>> = (0..NS).map(|_| Vec::new()).collect();
-    let mut long_names = Vec::new();
+    let mut root = vec![0u32; n];
     for i in 0..n as u32 {
-        let r = find(&mut parent, i);
-        let k = names[i as usize].0;
-        if r != i {
-            by_shard[(mix(k) >> (64 - SBITS)) as usize].push((k, names[r as usize].0));
-        } else if is_long(k) {
-            long_names.push((k, names[i as usize].1));
+        root[i as usize] = find(&mut parent, i);
+    }
+    eprintln!("  links: union-find {:?}", tl.elapsed());
+
+    // long person names
+    let mut long_names = Vec::new();
+    for i in 0..n {
+        if root[i] as usize == i && is_long(names[i]) {
+            long_names.push((names[i], long[&names[i]]));
         }
     }
-    let maxs = by_shard.iter().map(|v| v.len()).max().unwrap_or(0);
-    let rbits = ((maxs * 2).max(2)).next_power_of_two().trailing_zeros();
+    // each shard's ids fill that shard's region of the table
+    let maxs = (0..NS).map(|s| (sbase[s + 1] - sbase[s]) as usize).max().unwrap_or(0);
+    let rbits = ((maxs + maxs / 2).max(2)).next_power_of_two().trailing_zeros();
     let rsize = 1usize << rbits;
     let mut slots: Vec<(u128, u128)> = vec![(0, 0); rsize * NS];
-    slots
-        .par_chunks_mut(rsize)
-        .zip(by_shard.into_par_iter())
-        .for_each(|(region, v)| {
-            let m = rsize - 1;
-            for (k, p) in v {
-                let mut i = (mix(k) as usize) & m;
-                while region[i].0 != 0 {
-                    i = (i + 1) & m;
-                }
-                region[i] = (k, p);
+    slots.par_chunks_mut(rsize).enumerate().for_each(|(s, region)| {
+        let m = rsize - 1;
+        for i in sbase[s] as usize..sbase[s + 1] as usize {
+            let r = root[i] as usize;
+            if r == i {
+                continue;
             }
-        });
+            let k = names[i];
+            let mut j = (mix(k) as usize) & m;
+            while region[j].0 != 0 {
+                j = (j + 1) & m;
+            }
+            region[j] = (k, names[r]);
+        }
+    });
+    eprintln!("  links: table {:?}", tl.elapsed());
     Ok((LinkMap { slots, rbits }, long_names))
 }
 
@@ -1013,6 +1108,7 @@ fn flush_events(pend: &[Pend], ctx: &Ctx, person: &mut [Vec<PRec>], long: &mut V
 }
 
 fn parse_events(c: &Chunk, ctx: &Ctx) -> EvOut {
+    populate(c.data);
     let est = c.data.len() / 70 + 16;
     let mut dedup: Vec<Vec<DRec>> = (0..NE).map(|_| Vec::with_capacity(est / NE + est / NE / 4 + 4)).collect();
     let mut person: Vec<Vec<PRec>> = (0..NP).map(|_| Vec::with_capacity(est / NP + est / NP / 4 + 4)).collect();
@@ -1079,6 +1175,7 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> EvOut {
 }
 
 fn parse_clicks(c: &Chunk, ctx: &Ctx) -> Vec<Vec<CRec>> {
+    populate(c.data);
     let est = c.data.len() / 40 + 16;
     let mut out: Vec<Vec<CRec>> = (0..NP).map(|_| Vec::with_capacity(est / NP + est / NP / 4 + 4)).collect();
     let lo = ctx.ws - WEEK_MS;
