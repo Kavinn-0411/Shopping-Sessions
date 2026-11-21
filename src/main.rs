@@ -1308,6 +1308,27 @@ fn run() -> Res<()> {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()));
     rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global()?;
 
+    // Ask the kernel to start reading every input now (all files at full queue depth) in case
+    // they are not in the page cache; a no-op walk when they are.
+    if std::env::var_os("NOPREFETCH").is_none() {
+        let data = data.clone();
+        std::thread::spawn(move || {
+            use std::os::unix::io::AsRawFd;
+            for dir in ["links", "clicks", "events"] {
+                let Ok(rd) = std::fs::read_dir(data.join(dir)) else { continue };
+                let mut paths: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+                paths.sort();
+                for p in paths {
+                    if let Ok(f) = File::open(&p) {
+                        unsafe {
+                            libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let manifest = std::fs::read_to_string(data.join("manifest.json"))?;
     let ws = manifest_value(&manifest, "window_start").ok_or("bad manifest")?;
     let we = manifest_value(&manifest, "window_end").ok_or("bad manifest")?;
