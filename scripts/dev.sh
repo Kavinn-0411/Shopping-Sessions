@@ -11,7 +11,7 @@ MSYS_NO_PATHCONV=1 docker run --rm \
   -v "$ROOT:/w" -w /w -e CARGO_TARGET_DIR=/target -e RUSTFLAGS="-C target-cpu=x86-64-v3" \
   rust:1-slim-bookworm bash -c '
     set -e
-    cargo build --release 2>&1 | grep -E "^(error|warning: unused)|-->|Finished" || true
+    cargo build --release > /tmp/build.log 2>&1 || { grep -E "^error|-->" -A3 /tmp/build.log | head -30; echo BUILD FAILED; exit 1; }; tail -1 /tmp/build.log
     test -x /target/release/sessions
     if [ "'"$WHAT"'" != dev ]; then
       for c in $(ls fixtures); do [ -d fixtures/$c/input ] || continue

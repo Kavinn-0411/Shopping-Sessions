@@ -13,7 +13,6 @@ memchr = "2"
 libc = "0.2"
 rayon = "1.10"
 rustc-hash = "2"
-parquet = { version = "54", default-features = false }
 
 [profile.release]
 opt-level = 3

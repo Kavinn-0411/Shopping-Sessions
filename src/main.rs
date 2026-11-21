@@ -1131,14 +1131,51 @@ struct Pend {
     kind: u8,
 }
 
+/// Write-combining scatter: W records per bucket are staged in a small cache-resident buffer
+/// and appended to the bucket's vector together.
+struct Wc<T: Copy, const W: usize> {
+    buf: Vec<T>,
+    lens: Vec<u8>,
+    out: Vec<Vec<T>>,
+}
+
+impl<T: Copy, const W: usize> Wc<T, W> {
+    fn new(nb: usize, cap: usize, fill: T) -> Self {
+        Wc { buf: vec![fill; nb * W], lens: vec![0; nb], out: (0..nb).map(|_| Vec::with_capacity(cap)).collect() }
+    }
+    #[inline(always)]
+    fn push(&mut self, b: usize, x: T) {
+        unsafe {
+            let l = *self.lens.get_unchecked(b) as usize;
+            *self.buf.get_unchecked_mut(b * W + l) = x;
+            if l + 1 == W {
+                self.out.get_unchecked_mut(b).extend_from_slice(self.buf.get_unchecked(b * W..b * W + W));
+                *self.lens.get_unchecked_mut(b) = 0;
+            } else {
+                *self.lens.get_unchecked_mut(b) = (l + 1) as u8;
+            }
+        }
+    }
+    fn finish(mut self) -> Vec<Vec<T>> {
+        for b in 0..self.lens.len() {
+            let l = self.lens[b] as usize;
+            self.out[b].extend_from_slice(&self.buf[b * W..b * W + l]);
+        }
+        self.out
+    }
+}
+
+const WC: usize = 8;
+const PZERO: PRec = PRec { pkey: 0, ts: 0, price: 0, rec: 0, cat: 0, kind: 0 };
+
 #[inline(always)]
-fn flush_events(pend: &[Pend], ctx: &Ctx, person: &mut [Vec<PRec>], long: &mut Vec<(u64, B)>) {
+fn flush_events(pend: &[Pend], ctx: &Ctx, person: &mut Wc<PRec, WC>, long: &mut Vec<(u64, B)>) {
     for p in pend {
         let pkey = ctx.link.person(p.ukey);
         if pkey == p.ukey && is_long(pkey) {
             long.push((pkey, p.user));
         }
-        person[(mix(pkey) >> (64 - PBITS)) as usize].push(PRec {
+        person.push((mix(pkey) >> (64 - PBITS)) as usize, PRec {
             pkey,
             ts: p.ts,
             price: p.price,
@@ -1152,8 +1189,8 @@ fn flush_events(pend: &[Pend], ctx: &Ctx, person: &mut [Vec<PRec>], long: &mut V
 fn parse_events(c: &Chunk, ctx: &Ctx) -> EvOut {
     populate(c.data);
     let est = c.data.len() / 70 + 16;
-    let mut dedup: Vec<Vec<DRec>> = (0..NE).map(|_| Vec::with_capacity(est / NE + est / NE / 4 + 4)).collect();
-    let mut person: Vec<Vec<PRec>> = (0..NP).map(|_| Vec::with_capacity(est / NP + est / NP / 4 + 4)).collect();
+    let mut dedup: Wc<DRec, WC> = Wc::new(NE, est / NE + est / NE / 4 + 16, DEMPTY);
+    let mut person: Wc<PRec, WC> = Wc::new(NP, est / NP + est / NP / 4 + 16, PZERO);
     let mut long = Vec::new();
     let mut rec = c.base;
     let limit = c.data.as_ptr() as usize + c.data.len();
@@ -1166,7 +1203,7 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> EvOut {
         }
         let ingest = parse_ingest(f[3]);
         let key = key_fast(eid, limit);
-        dedup[(mix(key) >> (64 - EBITS)) as usize].push(DRec {
+        dedup.push((mix(key) >> (64 - EBITS)) as usize, DRec {
             key,
             ingest: (ingest / 1000).clamp(0, u32::MAX as i64) as u32,
             rec,
@@ -1212,7 +1249,7 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> EvOut {
         }
     });
     flush_events(&pend[..np], ctx, &mut person, &mut long);
-    EvOut { dedup, person, long }
+    EvOut { dedup: dedup.finish(), person: person.finish(), long }
 }
 
 fn parse_clicks(c: &Chunk, ctx: &Ctx) -> Vec<Vec<CRec>> {
@@ -1577,133 +1614,67 @@ fn person_bucket(b: usize, parsed: &[EvOut], clicks: &[Vec<Vec<CRec>>], winners:
 
 // ---------------------------------------------------------------- parquet
 
-use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
-use parquet::file::writer::SerializedFileWriter;
-use parquet::schema::parser::parse_message_type;
-
-fn props() -> Arc<WriterProperties> {
-    Arc::new(
-        WriterProperties::builder()
-            .set_dictionary_enabled(false)
-            .set_statistics_enabled(EnabledStatistics::None)
-            .build(),
-    )
-}
+mod pq;
+use pq::{Col, Logical, BYTE_ARRAY, INT32, INT64};
 
 fn write_users(path: &Path, parts: &[Vec<URow>], cat_names: &[B], long: &FxHashMap<u64, B>) -> Res<()> {
-    let rows: Vec<&URow> = parts.iter().flatten().collect();
-    let schema = Arc::new(parse_message_type(
-        "message user_daily {
-            REQUIRED BYTE_ARRAY user_id (UTF8);
-            REQUIRED INT32 day (DATE);
-            REQUIRED INT64 sessions;
-            REQUIRED INT64 events;
-            REQUIRED INT64 revenue_cents;
-            OPTIONAL BYTE_ARRAY top_category (UTF8);
-        }",
-    )?);
-    let mut w = SerializedFileWriter::new(File::create(path)?, schema, props())?;
-    let mut rg = w.next_row_group()?;
-    let mut idx = 0;
-    while let Some(mut col) = rg.next_column()? {
-        match idx {
-            0 => {
-                let v: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(key_bytes(r.pkey, long))).collect();
-                col.typed::<ByteArrayType>().write_batch(&v, None, None)?;
-            }
-            1 => {
-                let v: Vec<i32> = rows.iter().map(|r| r.day).collect();
-                col.typed::<Int32Type>().write_batch(&v, None, None)?;
-            }
-            2 | 3 | 4 => {
-                let v: Vec<i64> = rows
-                    .iter()
-                    .map(|r| match idx {
-                        2 => r.sessions,
-                        3 => r.events,
-                        _ => r.revenue,
-                    } as i64)
-                    .collect();
-                col.typed::<Int64Type>().write_batch(&v, None, None)?;
-            }
-            _ => {
-                let defs: Vec<i16> = rows.iter().map(|r| r.top.is_some() as i16).collect();
-                let v: Vec<ByteArray> = rows
-                    .iter()
-                    .filter_map(|r| r.top.map(|c| ByteArray::from(cat_names[c as usize].to_vec())))
-                    .collect();
-                col.typed::<ByteArrayType>().write_batch(&v, Some(&defs), None)?;
+    let n: usize = parts.iter().map(|p| p.len()).sum();
+    let mut uid = Col::new("user_id", BYTE_ARRAY, Logical::String, false, n * 14);
+    let mut day = Col::new("day", INT32, Logical::Date, false, n * 4);
+    let mut ses = Col::new("sessions", INT64, Logical::None, false, n * 8);
+    let mut evs = Col::new("events", INT64, Logical::None, false, n * 8);
+    let mut rev = Col::new("revenue_cents", INT64, Logical::None, false, n * 8);
+    let mut top = Col::new("top_category", BYTE_ARRAY, Logical::String, true, n * 8);
+    let mut name = Vec::with_capacity(64);
+    for r in parts.iter().flatten() {
+        name.clear();
+        if is_long(r.pkey) {
+            name.extend_from_slice(long.get(&r.pkey).copied().unwrap_or(&[]));
+        } else {
+            for i in 0..MAXPACK {
+                let code = (r.pkey >> (6 * (MAXPACK - 1 - i))) & 63;
+                if code == 0 {
+                    break;
+                }
+                name.push(DECODE[code as usize]);
             }
         }
-        col.close()?;
-        idx += 1;
+        uid.put_bytes(&name);
+        day.put_i32(r.day);
+        ses.put_i64(r.sessions as i64);
+        evs.put_i64(r.events as i64);
+        rev.put_i64(r.revenue as i64);
+        top.put_opt_bytes(r.top.map(|c| cat_names[c as usize]));
     }
-    rg.close()?;
-    w.close()?;
+    pq::write(path, &[uid, day, ses, evs, rev, top], n)?;
     Ok(())
 }
 
-fn write_campaigns(
-    path: &Path,
-    agg: &[[u64; 4]],
-    ids: &[B],
-    ch: &[B],
-    day0: i64,
-    nd: usize,
-) -> Res<()> {
-    let mut rows: Vec<(B, B, i32, [u64; 4])> = Vec::new();
+fn write_campaigns(path: &Path, agg: &[[u64; 4]], ids: &[B], ch: &[B], day0: i64, nd: usize) -> Res<()> {
+    let mut cid = Col::new("campaign_id", BYTE_ARRAY, Logical::String, false, 0);
+    let mut chn = Col::new("channel", BYTE_ARRAY, Logical::String, false, 0);
+    let mut day = Col::new("day", INT32, Logical::Date, false, 0);
+    let mut ses = Col::new("sessions", INT64, Logical::None, false, 0);
+    let mut pur = Col::new("purchasing_sessions", INT64, Logical::None, false, 0);
+    let mut rev = Col::new("revenue_cents", INT64, Logical::None, false, 0);
+    let mut ast = Col::new("assisted_sessions", INT64, Logical::None, false, 0);
+    let mut n = 0;
     for c in 0..=ids.len() {
         for d in 0..nd {
             let a = agg[c * nd + d];
             if a[0] > 0 || a[3] > 0 {
-                let (id, chn): (B, B) = if c == ids.len() {
-                    (b"organic", b"organic")
-                } else {
-                    (ids[c], ch[c])
-                };
-                let assisted = if c == ids.len() { 0 } else { a[3] };
-                rows.push((id, chn, (day0 + d as i64) as i32, [a[0], a[1], a[2], assisted]));
+                let organic = c == ids.len();
+                cid.put_bytes(if organic { b"organic" } else { ids[c] });
+                chn.put_bytes(if organic { b"organic" } else { ch[c] });
+                day.put_i32((day0 + d as i64) as i32);
+                ses.put_i64(a[0] as i64);
+                pur.put_i64(a[1] as i64);
+                rev.put_i64(a[2] as i64);
+                ast.put_i64(if organic { 0 } else { a[3] as i64 });
+                n += 1;
             }
         }
     }
-    let schema = Arc::new(parse_message_type(
-        "message campaign_daily {
-            REQUIRED BYTE_ARRAY campaign_id (UTF8);
-            REQUIRED BYTE_ARRAY channel (UTF8);
-            REQUIRED INT32 day (DATE);
-            REQUIRED INT64 sessions;
-            REQUIRED INT64 purchasing_sessions;
-            REQUIRED INT64 revenue_cents;
-            REQUIRED INT64 assisted_sessions;
-        }",
-    )?);
-    let mut w = SerializedFileWriter::new(File::create(path)?, schema, props())?;
-    let mut rg = w.next_row_group()?;
-    let mut idx = 0;
-    while let Some(mut col) = rg.next_column()? {
-        match idx {
-            0 | 1 => {
-                let v: Vec<ByteArray> = rows
-                    .iter()
-                    .map(|r| ByteArray::from(if idx == 0 { r.0 } else { r.1 }.to_vec()))
-                    .collect();
-                col.typed::<ByteArrayType>().write_batch(&v, None, None)?;
-            }
-            2 => {
-                let v: Vec<i32> = rows.iter().map(|r| r.2).collect();
-                col.typed::<Int32Type>().write_batch(&v, None, None)?;
-            }
-            _ => {
-                let k = idx - 3;
-                let v: Vec<i64> = rows.iter().map(|r| r.3[k] as i64).collect();
-                col.typed::<Int64Type>().write_batch(&v, None, None)?;
-            }
-        }
-        col.close()?;
-        idx += 1;
-    }
-    rg.close()?;
-    w.close()?;
+    pq::write(path, &[cid, chn, day, ses, pur, rev, ast], n)?;
     Ok(())
 }
