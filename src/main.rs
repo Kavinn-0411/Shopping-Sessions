@@ -1035,12 +1035,33 @@ fn run() -> Res<()> {
     (0..NE).into_par_iter().for_each(|b| dedup_bucket(b, &parsed, &winners));
     eprintln!("[{:?}] dedup", t0.elapsed());
 
-    // long names: from links and from unlinked long user ids
+    // long names: from links and from unlinked long user ids (copied out of the event files,
+    // which are unmapped below)
     let mut long: FxHashMap<u64, B> = FxHashMap::default();
     long.extend(long_link);
     for p in &parsed {
-        long.extend(p.long.iter().copied());
+        for &(k, s) in &p.long {
+            long.entry(k).or_insert_with(|| Box::leak(s.to_vec().into_boxed_slice()));
+        }
     }
+    // Free what later stages no longer need in the background, so less is left to tear down
+    // at exit. Nothing below refers to event-file bytes or dedup records.
+    let mut parsed = parsed;
+    if std::env::var_os("NOBG").is_none() {
+        let dedup_bufs: Vec<Vec<Vec<DRec>>> = parsed.iter_mut().map(|p| std::mem::take(&mut p.dedup)).collect();
+        let maps: Vec<(usize, usize)> = ev_files.iter().map(|f| (f.as_ptr() as usize, f.len())).collect();
+        std::thread::spawn(move || {
+            drop(dedup_bufs);
+            for (ptr, len) in maps {
+                if len > 0 {
+                    unsafe {
+                        libc::munmap(ptr as *mut libc::c_void, len);
+                    }
+                }
+            }
+        });
+    }
+    let parsed = parsed;
 
     // ---- sessionize + attribute per person bucket
     let nthreads = rayon::current_num_threads();
