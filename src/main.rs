@@ -398,10 +398,10 @@ fn scan<const N: usize>(c: &Chunk, mut on_line: impl FnMut(&[B; N])) {
                 if nf == N {
                     bad = true;
                 } else if qc == 0 {
-                    fields[nf] = &d[fs..p];
+                    fields[nf] = unsafe { d.get_unchecked(fs..p) };
                     nf += 1;
                 } else if qc == 2 && p - fs >= 2 && d[fs] == b'"' && d[p - 1] == b'"' {
-                    fields[nf] = &d[fs + 1..p - 1];
+                    fields[nf] = unsafe { d.get_unchecked(fs + 1..p - 1) };
                     nf += 1;
                 } else {
                     bad = true;
