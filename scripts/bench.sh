@@ -21,9 +21,8 @@ MSYS_NO_PATHCONV=1 docker run --rm --cpus 8 --memory 24g --memory-swap 24g \
         DATA_DIR=/d/$ds OUTPUT_DIR=$o NCPU=8 /d/bin/'"$TAG"' 2> /tmp/log
         echo "$ds run$r: $(( ($(date +%s%N)-s)/1000000 )) ms | $(tail -1 /tmp/log)"
       done
-      if [ -n "'"$REF"'" ]; then
-        for t in user_daily campaign_daily; do
-          if cmp -s <(cd /d/out/'"$REF"'/$ds/$t && cat *.parquet | md5sum) <(cd $o/$t && cat *.parquet | md5sum); then echo "  $t: identical bytes"; else echo "  $t: bytes differ (run compare)"; fi
-        done
-      fi
     done'
+if [ -n "$REF" ]; then
+  MSYS_NO_PATHCONV=1 docker run --rm -v sessions-data:/d -v "$ROOT/scripts:/s" sessions-checker sh -c '
+    for ds in '"$*"'; do echo "== $ds vs '"$REF"'"; python /s/compare.py /d/out/'"$REF"'/$ds /d/out/'"$TAG"'/$ds | grep -E "rows|MATCH|DIFFER"; done'
+fi
