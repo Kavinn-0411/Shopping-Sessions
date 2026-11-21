@@ -555,7 +555,11 @@ fn run() -> Res<()> {
     std::fs::create_dir_all(&cd)?;
     write_users(&ud.join("part-0.parquet"), &users, &cat_names)?;
     write_campaigns(&cd.join("part-0.parquet"), &camp_agg, &camp_ids, &camp_ch, day0, nd)?;
-    eprintln!("[{:?}] done: {} user rows", t0.elapsed(), users.len());
+    let hwm = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM")).map(|l| l.to_string()))
+        .unwrap_or_default();
+    eprintln!("[{:?}] done: {} user rows; {}", t0.elapsed(), users.len(), hwm);
     Ok(())
 }
 
