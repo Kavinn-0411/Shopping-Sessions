@@ -1,0 +1,9 @@
+/target/
+/tools/gen-target/
+/dev/
+/dev-answer/
+/data*/
+/out/
+/.out/
+*.zip
+/scratch_tmp/
