@@ -9,9 +9,9 @@
 //!   per person bucket: filter winners, group, sessionize, attribute
 //!   parquet written in parallel
 //!
-//! IDs of at most 15 bytes are packed exactly into a u128 (bytes big-endian, length in the
-//! low byte), so key order equals byte-wise string order. Longer IDs get a 120-bit hash with
-//! low byte 0xFF and their bytes are kept in side tables.
+//! IDs of 1 to 10 characters from [0-9A-Za-z] (every generated ID) are packed exactly into a
+//! u64 whose order equals byte-wise string order; any other ID gets a 63-bit hash with the top
+//! bit set, and its bytes are kept in side tables.
 
 use memchr::{memchr, memchr_iter};
 use memmap2::Mmap;
@@ -51,63 +51,99 @@ fn fmix(mut h: u64) -> u64 {
 }
 
 #[inline]
-fn mix(k: u128) -> u64 {
-    fmix((k as u64) ^ ((k >> 64) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+fn mix(k: u64) -> u64 {
+    fmix(k ^ 0x9E37_79B9_7F4A_7C15)
 }
 
-fn long_key(s: &[u8]) -> u128 {
-    let mut h1: u64 = 0x243F_6A88_85A3_08D3 ^ s.len() as u64;
-    let mut h2: u64 = 0x1319_8A2E_0370_7344 ^ (s.len() as u64).rotate_left(17);
+/// 6-bit codes for [0-9A-Za-z] in ASCII order (0 = not in the alphabet).
+const CODE: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 10 {
+        t[b'0' as usize + i] = 1 + i as u8;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 26 {
+        t[b'A' as usize + i] = 11 + i as u8;
+        t[b'a' as usize + i] = 37 + i as u8;
+        i += 1;
+    }
+    t
+};
+const DECODE: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut i = 0;
+    while i < 256 {
+        if CODE[i] != 0 {
+            t[CODE[i] as usize] = i as u8;
+        }
+        i += 1;
+    }
+    t
+};
+const MAXPACK: usize = 10;
+const HASHED: u64 = 1 << 63;
+
+#[cold]
+fn hashed_key(s: &[u8]) -> u64 {
+    let mut h: u64 = 0x243F_6A88_85A3_08D3 ^ s.len() as u64;
     for c in s.chunks(8) {
         let mut w = [0u8; 8];
         w[..c.len()].copy_from_slice(c);
-        let w = u64::from_le_bytes(w);
-        h1 = (h1 ^ w).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23);
-        h2 = (h2 ^ w).wrapping_mul(0xC2B2_AE3D_27D4_EB4F).rotate_left(37);
+        h = (h ^ u64::from_le_bytes(w)).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
     }
-    let k = ((fmix(h1) as u128) << 64) | fmix(h2 ^ h1.rotate_left(7)) as u128;
-    k | 0xFF
+    fmix(h) | HASHED
 }
 
-#[inline]
-fn key_of(s: &[u8]) -> u128 {
+/// Key of an ID. Strings of 1 to 10 characters from [0-9A-Za-z] are packed exactly, 6 bits a
+/// character, first character highest, so key order is byte order. Anything else is hashed
+/// (top bit set) and its bytes are kept in side tables where order or bytes matter.
+#[inline(always)]
+fn key_of(s: &[u8]) -> u64 {
     let n = s.len();
-    if n <= 15 {
-        let mut buf = [0u8; 16];
-        buf[..n].copy_from_slice(s);
-        buf[15] = n as u8;
-        u128::from_be_bytes(buf)
-    } else {
-        long_key(s)
+    if n == 0 {
+        return 0;
     }
+    if n <= MAXPACK {
+        let mut v: u64 = 0;
+        let mut ok = true;
+        for &c in s {
+            let code = CODE[c as usize];
+            ok &= code != 0;
+            v = (v << 6) | code as u64;
+        }
+        if ok {
+            return v << (6 * (MAXPACK - n));
+        }
+    }
+    hashed_key(s)
 }
 
 #[inline]
-fn is_long(k: u128) -> bool {
-    (k as u8) == 0xFF
+fn is_long(k: u64) -> bool {
+    k & HASHED != 0
 }
 
-fn key_bytes(k: u128, long: &FxHashMap<u128, B>) -> Vec<u8> {
+fn key_bytes(k: u64, long: &FxHashMap<u64, B>) -> Vec<u8> {
     if is_long(k) {
         long.get(&k).map(|s| s.to_vec()).unwrap_or_default()
     } else {
-        let b = k.to_be_bytes();
-        b[..b[15] as usize].to_vec()
+        let mut v = Vec::with_capacity(MAXPACK);
+        for i in 0..MAXPACK {
+            let code = (k >> (6 * (MAXPACK - 1 - i))) & 63;
+            if code == 0 {
+                break;
+            }
+            v.push(DECODE[code as usize]);
+        }
+        v
     }
 }
 
-/// Like key_of, but reads 16 bytes at once when that stays below `limit`.
 #[inline(always)]
-fn key_fast(s: &[u8], limit: usize) -> u128 {
-    let n = s.len();
-    if n <= 15 && (s.as_ptr() as usize) + 16 <= limit {
-        let raw = unsafe { std::ptr::read_unaligned(s.as_ptr() as *const [u8; 16]) };
-        let v = u128::from_be_bytes(raw);
-        let mask: u128 = if n == 0 { 0 } else { !0u128 << (8 * (16 - n)) };
-        (v & mask) | n as u128
-    } else {
-        key_of(s)
-    }
+fn key_fast(s: &[u8], _limit: usize) -> u64 {
+    key_of(s)
 }
 
 /// Lookup for IDs like `p123` / `c_45`: a direct array for `<prefix><digits, no leading zero>`,
@@ -167,7 +203,7 @@ impl<V: Copy> IdLookup<V> {
 
 /// Exact lookup table keyed by byte strings, via packed keys (long keys verified by bytes).
 struct KeyMap<V: Copy> {
-    short: FxHashMap<u128, V>,
+    short: FxHashMap<u64, V>,
     long: FxHashMap<B, V>,
 }
 
@@ -176,16 +212,18 @@ impl<V: Copy> KeyMap<V> {
         KeyMap { short: FxHashMap::default(), long: FxHashMap::default() }
     }
     fn insert_if_absent(&mut self, s: B, v: V) {
-        if s.len() <= 15 {
-            self.short.entry(key_of(s)).or_insert(v);
+        let k = key_of(s);
+        if !is_long(k) {
+            self.short.entry(k).or_insert(v);
         } else {
             self.long.entry(s).or_insert(v);
         }
     }
     #[inline]
     fn get(&self, s: &[u8]) -> Option<V> {
-        if s.len() <= 15 {
-            self.short.get(&key_of(s)).copied()
+        let k = key_of(s);
+        if !is_long(k) {
+            self.short.get(&k).copied()
         } else {
             self.long.get(s).copied()
         }
@@ -581,18 +619,17 @@ fn manifest_value(text: &str, key: &str) -> Option<i64> {
 /// Dedup entry: one per parsed event line with a non-empty event_id.
 #[derive(Clone, Copy)]
 struct DRec {
-    hi: u64,
-    lo: u64,
+    key: u64,
     ingest: u32, // epoch seconds (ingest_ts is whole-second F1)
     rec: u32,
 }
 
-const DEMPTY: DRec = DRec { hi: 0, lo: 0, ingest: 0, rec: 0 };
+const DEMPTY: DRec = DRec { key: 0, ingest: 0, rec: 0 };
 
 /// A valid (validated, not late) event, routed by person.
 #[derive(Clone, Copy)]
 struct PRec {
-    pkey: u128,
+    pkey: u64,
     ts: u32, // ms since window start
     price: u32,
     rec: u32,
@@ -603,14 +640,14 @@ struct PRec {
 /// A valid click, routed by person.
 #[derive(Clone, Copy)]
 struct CRec {
-    pkey: u128,
+    pkey: u64,
     cid: B,
     ts: i64,
     camp: u32,
 }
 
 struct URow {
-    pkey: u128,
+    pkey: u64,
     day: i32,
     sessions: u64,
     events: u64,
@@ -620,20 +657,20 @@ struct URow {
 
 /// id-key -> person-key, open addressing in NS independent regions (built in parallel).
 struct LinkMap {
-    slots: Vec<(u128, u128)>,
+    slots: Vec<(u64, u64)>,
     rbits: u32,
 }
 
 impl LinkMap {
     #[inline(always)]
-    fn home(&self, k: u128) -> (usize, usize, usize) {
+    fn home(&self, k: u64) -> (usize, usize, usize) {
         let h = mix(k);
         let base = ((h >> (64 - SBITS)) as usize) << self.rbits;
         let m = (1usize << self.rbits) - 1;
         (base, (h as usize) & m, m)
     }
     #[inline(always)]
-    fn prefetch(&self, k: u128) {
+    fn prefetch(&self, k: u64) {
         let (base, i, _) = self.home(k);
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -642,7 +679,7 @@ impl LinkMap {
         }
     }
     #[inline(always)]
-    fn person(&self, k: u128) -> u128 {
+    fn person(&self, k: u64) -> u64 {
         let (base, mut i, m) = self.home(k);
         loop {
             let (kk, v) = unsafe { *self.slots.get_unchecked(base + i) };
@@ -694,44 +731,28 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
-/// Byte-wise order of two ID keys; long keys are compared through their bytes.
+/// Byte-wise order of two ID keys; hashed keys are compared through their bytes.
 #[inline]
-fn key_lt(a: u128, b: u128, long: &FxHashMap<u128, B>) -> bool {
+fn key_lt(a: u64, b: u64, long: &FxHashMap<u64, B>) -> bool {
     if !is_long(a) && !is_long(b) {
         a < b
     } else {
-        let sa: &[u8] = if is_long(a) { long[&a] } else { &[] };
-        let sb: &[u8] = if is_long(b) { long[&b] } else { &[] };
-        let ba;
-        let bb;
-        let x: &[u8] = if is_long(a) {
-            sa
-        } else {
-            ba = a.to_be_bytes();
-            &ba[..ba[15] as usize]
-        };
-        let y: &[u8] = if is_long(b) {
-            sb
-        } else {
-            bb = b.to_be_bytes();
-            &bb[..bb[15] as usize]
-        };
-        x < y
+        key_bytes(a, long) < key_bytes(b, long)
     }
 }
 
 #[inline]
-fn shard_of(k: u128) -> usize {
+fn shard_of(k: u64) -> usize {
     (mix(k) >> (64 - SBITS)) as usize
 }
 
 /// Returns the id-key -> person-key map and the bytes of long person names.
-fn build_links(data: &Path, ncpu: usize) -> Res<(LinkMap, Vec<(u128, B)>)> {
+fn build_links(data: &Path, ncpu: usize) -> Res<(LinkMap, Vec<(u64, B)>)> {
     let tl = Instant::now();
     let files = map_dir(&data.join("links"))?;
     let chunks = make_chunks(&files, chunk_target(&files, ncpu).min(4 << 20));
     // parse straight into key pairs; long ids keep their bytes on the side
-    let parsed: Vec<(Vec<(u128, u128)>, Vec<(u128, B)>)> = chunks
+    let parsed: Vec<(Vec<(u64, u64)>, Vec<(u64, B)>)> = chunks
         .par_iter()
         .map(|c| {
             let limit = c.data.as_ptr() as usize + c.data.len();
@@ -754,7 +775,7 @@ fn build_links(data: &Path, ncpu: usize) -> Res<(LinkMap, Vec<(u128, B)>)> {
             (edges, long)
         })
         .collect();
-    let mut long: FxHashMap<u128, B> = FxHashMap::default();
+    let mut long: FxHashMap<u64, B> = FxHashMap::default();
     for (_, l) in &parsed {
         long.extend(l.iter().copied());
     }
@@ -768,11 +789,11 @@ fn build_links(data: &Path, ncpu: usize) -> Res<(LinkMap, Vec<(u128, B)>)> {
         ne += e.len();
     }
     // scatter endpoints (key, slot) by shard
-    let scattered: Vec<Vec<Vec<(u128, u32)>>> = parsed
+    let scattered: Vec<Vec<Vec<(u64, u32)>>> = parsed
         .par_iter()
         .zip(base.par_iter())
         .map(|((edges, _), &b0)| {
-            let mut out: Vec<Vec<(u128, u32)>> = (0..NS).map(|_| Vec::with_capacity(edges.len() * 2 / NS + 8)).collect();
+            let mut out: Vec<Vec<(u64, u32)>> = (0..NS).map(|_| Vec::with_capacity(edges.len() * 2 / NS + 8)).collect();
             for (i, &(a, b)) in edges.iter().enumerate() {
                 let slot = 2 * (b0 + i) as u32;
                 out[shard_of(a)].push((a, slot));
@@ -782,11 +803,11 @@ fn build_links(data: &Path, ncpu: usize) -> Res<(LinkMap, Vec<(u128, B)>)> {
         })
         .collect();
     // intern per shard: local ids and the shard's key list
-    let interned: Vec<(Vec<u128>, Vec<(u32, u32)>)> = (0..NS)
+    let interned: Vec<(Vec<u64>, Vec<(u32, u32)>)> = (0..NS)
         .into_par_iter()
         .map(|s| {
             let total: usize = scattered.iter().map(|v| v[s].len()).sum();
-            let mut m: FxHashMap<u128, u32> = FxHashMap::default();
+            let mut m: FxHashMap<u64, u32> = FxHashMap::default();
             m.reserve(total);
             let mut keys = Vec::new();
             let mut slots = Vec::with_capacity(total);
@@ -808,7 +829,7 @@ fn build_links(data: &Path, ncpu: usize) -> Res<(LinkMap, Vec<(u128, B)>)> {
         sbase[s + 1] = sbase[s] + interned[s].0.len() as u32;
     }
     let n = sbase[NS] as usize;
-    let mut names: Vec<u128> = Vec::with_capacity(n);
+    let mut names: Vec<u64> = Vec::with_capacity(n);
     for (keys, _) in &interned {
         names.extend_from_slice(keys);
     }
@@ -850,7 +871,7 @@ fn build_links(data: &Path, ncpu: usize) -> Res<(LinkMap, Vec<(u128, B)>)> {
     let maxs = (0..NS).map(|s| (sbase[s + 1] - sbase[s]) as usize).max().unwrap_or(0);
     let rbits = ((maxs + maxs / 2).max(2)).next_power_of_two().trailing_zeros();
     let rsize = 1usize << rbits;
-    let mut slots: Vec<(u128, u128)> = vec![(0, 0); rsize * NS];
+    let mut slots: Vec<(u64, u64)> = vec![(0, 0); rsize * NS];
     slots.par_chunks_mut(rsize).enumerate().for_each(|(s, region)| {
         let m = rsize - 1;
         for i in sbase[s] as usize..sbase[s + 1] as usize {
@@ -994,7 +1015,7 @@ fn run() -> Res<()> {
     eprintln!("[{:?}] dedup", t0.elapsed());
 
     // long names: from links and from unlinked long user ids
-    let mut long: FxHashMap<u128, B> = FxHashMap::default();
+    let mut long: FxHashMap<u64, B> = FxHashMap::default();
     long.extend(long_link);
     for p in &parsed {
         long.extend(p.long.iter().copied());
@@ -1054,7 +1075,7 @@ fn run() -> Res<()> {
 struct EvOut {
     dedup: Vec<Vec<DRec>>,
     person: Vec<Vec<PRec>>,
-    long: Vec<(u128, B)>,
+    long: Vec<(u64, B)>,
 }
 
 /// ingest_ts is always valid F1; fall back to the full parser if it is not 20 bytes.
@@ -1080,7 +1101,7 @@ const BATCH: usize = 16;
 
 #[derive(Clone, Copy)]
 struct Pend {
-    ukey: u128,
+    ukey: u64,
     user: B,
     ts: u32,
     price: u32,
@@ -1090,7 +1111,7 @@ struct Pend {
 }
 
 #[inline(always)]
-fn flush_events(pend: &[Pend], ctx: &Ctx, person: &mut [Vec<PRec>], long: &mut Vec<(u128, B)>) {
+fn flush_events(pend: &[Pend], ctx: &Ctx, person: &mut [Vec<PRec>], long: &mut Vec<(u64, B)>) {
     for p in pend {
         let pkey = ctx.link.person(p.ukey);
         if pkey == p.ukey && is_long(pkey) {
@@ -1125,8 +1146,7 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> EvOut {
         let ingest = parse_ingest(f[3]);
         let key = key_fast(eid, limit);
         dedup[(mix(key) >> (64 - EBITS)) as usize].push(DRec {
-            hi: (key >> 64) as u64,
-            lo: key as u64,
+            key,
             ingest: (ingest / 1000).clamp(0, u32::MAX as i64) as u32,
             rec,
         });
@@ -1180,9 +1200,9 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx) -> Vec<Vec<CRec>> {
     let mut out: Vec<Vec<CRec>> = (0..NP).map(|_| Vec::with_capacity(est / NP + est / NP / 4 + 4)).collect();
     let lo = ctx.ws - WEEK_MS;
     let limit = c.data.as_ptr() as usize + c.data.len();
-    let mut pend: [(u128, B, i64, u32); BATCH] = [(0, &[], 0, 0); BATCH];
+    let mut pend: [(u64, B, i64, u32); BATCH] = [(0, &[], 0, 0); BATCH];
     let mut np = 0usize;
-    let flush = |pend: &[(u128, B, i64, u32)], out: &mut Vec<Vec<CRec>>| {
+    let flush = |pend: &[(u64, B, i64, u32)], out: &mut Vec<Vec<CRec>>| {
         for &(ukey, cid, ts, camp) in pend {
             let pkey = ctx.link.person(ukey);
             out[(mix(pkey) >> (64 - PBITS)) as usize].push(CRec { pkey, cid, ts, camp });
@@ -1231,15 +1251,14 @@ fn dedup_bucket(b: usize, parsed: &[EvOut], winners: &[AtomicU64]) {
         let table = &mut tab[..cap];
         for p in parsed {
             for d in &p.dedup[b] {
-                let key = ((d.hi as u128) << 64) | d.lo as u128;
-                let mut i = (mix(key) as usize) & mask;
+                let mut i = (mix(d.key) as usize) & mask;
                 loop {
                     let t = &mut table[i];
-                    if t.hi == 0 && t.lo == 0 {
+                    if t.key == 0 {
                         *t = *d;
                         break;
                     }
-                    if t.hi == d.hi && t.lo == d.lo {
+                    if t.key == d.key {
                         if d.ingest < t.ingest {
                             t.ingest = d.ingest;
                             t.rec = d.rec;
@@ -1251,7 +1270,7 @@ fn dedup_bucket(b: usize, parsed: &[EvOut], winners: &[AtomicU64]) {
             }
         }
         for t in table.iter_mut() {
-            if t.hi != 0 || t.lo != 0 {
+            if t.key != 0 {
                 winners[(t.rec >> 6) as usize].fetch_or(1u64 << (t.rec & 63), Ordering::Relaxed);
                 *t = DEMPTY;
             }
@@ -1268,8 +1287,8 @@ fn is_winner(w: &[AtomicU64], rec: u32) -> bool {
 struct PState {
     camp_agg: Vec<[u64; 4]>,
     users: Vec<URow>,
-    pid_of: FxHashMap<u128, u32>,
-    pkeys: Vec<u128>,
+    pid_of: FxHashMap<u64, u32>,
+    pkeys: Vec<u64>,
     ids: Vec<u32>,
     start: Vec<u32>,
     fill: Vec<u32>,
@@ -1551,7 +1570,7 @@ fn props() -> Arc<WriterProperties> {
     )
 }
 
-fn write_users(path: &Path, parts: &[Vec<URow>], cat_names: &[B], long: &FxHashMap<u128, B>) -> Res<()> {
+fn write_users(path: &Path, parts: &[Vec<URow>], cat_names: &[B], long: &FxHashMap<u64, B>) -> Res<()> {
     let rows: Vec<&URow> = parts.iter().flatten().collect();
     let schema = Arc::new(parse_message_type(
         "message user_daily {
