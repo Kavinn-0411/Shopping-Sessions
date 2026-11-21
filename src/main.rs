@@ -97,6 +97,75 @@ fn key_bytes(k: u128, long: &FxHashMap<u128, B>) -> Vec<u8> {
     }
 }
 
+/// Like key_of, but reads 16 bytes at once when that stays below `limit`.
+#[inline(always)]
+fn key_fast(s: &[u8], limit: usize) -> u128 {
+    let n = s.len();
+    if n <= 15 && (s.as_ptr() as usize) + 16 <= limit {
+        let raw = unsafe { std::ptr::read_unaligned(s.as_ptr() as *const [u8; 16]) };
+        let v = u128::from_be_bytes(raw);
+        let mask: u128 = if n == 0 { 0 } else { !0u128 << (8 * (16 - n)) };
+        (v & mask) | n as u128
+    } else {
+        key_of(s)
+    }
+}
+
+/// Lookup for IDs like `p123` / `c_45`: a direct array for `<prefix><digits, no leading zero>`,
+/// exact KeyMap fallback for every other string.
+struct IdLookup<V: Copy> {
+    prefix: &'static [u8],
+    arr: Vec<Option<V>>,
+    map: KeyMap<V>,
+}
+
+const ID_ARRAY_MAX: u64 = 1 << 22;
+
+impl<V: Copy> IdLookup<V> {
+    fn new(prefix: &'static [u8]) -> Self {
+        IdLookup { prefix, arr: Vec::new(), map: KeyMap::new() }
+    }
+    #[inline]
+    fn num(&self, s: &[u8]) -> Option<u64> {
+        let p = self.prefix.len();
+        if s.len() <= p || s.len() > p + 7 || &s[..p] != self.prefix || s[p] == b'0' {
+            return None;
+        }
+        let mut v = 0u64;
+        for &c in &s[p..] {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            v = v * 10 + (c - b'0') as u64;
+        }
+        if v < ID_ARRAY_MAX {
+            Some(v)
+        } else {
+            None
+        }
+    }
+    fn insert_if_absent(&mut self, s: B, v: V) {
+        if let Some(n) = self.num(s) {
+            let n = n as usize;
+            if self.arr.len() <= n {
+                self.arr.resize(n + 1, None);
+            }
+            if self.arr[n].is_none() {
+                self.arr[n] = Some(v);
+            }
+        } else {
+            self.map.insert_if_absent(s, v);
+        }
+    }
+    #[inline]
+    fn get(&self, s: &[u8]) -> Option<V> {
+        match self.num(s) {
+            Some(n) => self.arr.get(n as usize).copied().flatten(),
+            None => self.map.get(s),
+        }
+    }
+}
+
 /// Exact lookup table keyed by byte strings, via packed keys (long keys verified by bytes).
 struct KeyMap<V: Copy> {
     short: FxHashMap<u128, V>,
@@ -212,6 +281,112 @@ fn for_each_line(c: &Chunk, mut f: impl FnMut(B)) {
         };
         f(&d[pos..end]);
         pos = end + 1;
+    }
+}
+
+/// Bitmasks of ',', '\n' and '"' in 64 bytes at `p`.
+#[inline(always)]
+fn masks64(p: *const u8) -> (u64, u64, u64) {
+    #[cfg(target_feature = "avx2")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let a = _mm256_loadu_si256(p as *const __m256i);
+        let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let m = |x: __m256i, c: u8| -> u64 { _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, _mm256_set1_epi8(c as i8))) as u32 as u64 };
+        (
+            m(a, b',') | (m(b, b',') << 32),
+            m(a, b'\n') | (m(b, b'\n') << 32),
+            m(a, b'"') | (m(b, b'"') << 32),
+        )
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        let (mut c, mut n, mut q) = (0u64, 0u64, 0u64);
+        for i in 0..64 {
+            let x = unsafe { *p.add(i) };
+            c |= ((x == b',') as u64) << i;
+            n |= ((x == b'\n') as u64) << i;
+            q |= ((x == b'"') as u64) << i;
+        }
+        (c, n, q)
+    }
+}
+
+/// Scan a chunk, calling `on_line` with the N unquoted fields of every well-formed line.
+#[inline(always)]
+fn scan<const N: usize>(c: &Chunk, mut on_line: impl FnMut(&[B; N])) {
+    let d = c.data;
+    let end = d.len();
+    let mut pos = 0;
+    if c.skip_first {
+        match memchr(b'\n', d) {
+            Some(i) => pos = i + 1,
+            None => return,
+        }
+    }
+    if pos >= end {
+        return;
+    }
+    let mut fields: [B; N] = [&[]; N];
+    let mut nf = 0usize;
+    let mut bad = false;
+    let mut fs = pos;
+    let mut q_fs: u64 = 0;
+    let mut qb: u64 = 0;
+    let mut blk = pos;
+    let mut buf = [0u8; 64];
+    macro_rules! field {
+        ($p:expr, $qc:expr) => {{
+            let p = $p;
+            let qc = $qc;
+            if !bad {
+                if nf == N {
+                    bad = true;
+                } else if qc == 0 {
+                    fields[nf] = &d[fs..p];
+                    nf += 1;
+                } else if qc == 2 && p - fs >= 2 && d[fs] == b'"' && d[p - 1] == b'"' {
+                    fields[nf] = &d[fs + 1..p - 1];
+                    nf += 1;
+                } else {
+                    bad = true;
+                }
+            }
+        }};
+    }
+    while blk < end {
+        let (cm, nl, qt) = if blk + 64 <= end {
+            masks64(unsafe { d.as_ptr().add(blk) })
+        } else {
+            buf = [0u8; 64];
+            buf[..end - blk].copy_from_slice(&d[blk..]);
+            masks64(buf.as_ptr())
+        };
+        let mut st = cm | nl;
+        while st != 0 {
+            let bit = st.trailing_zeros();
+            let p = blk + bit as usize;
+            let below = (qt & ((1u64 << bit) - 1)).count_ones() as u64;
+            field!(p, qb + below - q_fs);
+            if (nl >> bit) & 1 != 0 {
+                if !bad && nf == N {
+                    on_line(&fields);
+                }
+                nf = 0;
+                bad = false;
+            }
+            fs = p + 1;
+            q_fs = qb + below;
+            st &= st - 1;
+        }
+        qb += qt.count_ones() as u64;
+        blk += 64;
+    }
+    if fs < end || nf > 0 {
+        field!(end, qb - q_fs);
+        if !bad && nf == N {
+            on_line(&fields);
+        }
     }
 }
 
@@ -423,26 +598,53 @@ struct URow {
     top: Option<u16>,
 }
 
+/// id-key -> person-key, open addressing in NS independent regions (built in parallel).
 struct LinkMap {
-    shards: Vec<FxHashMap<u128, u128>>,
+    slots: Vec<(u128, u128)>,
+    rbits: u32,
 }
 
 impl LinkMap {
-    #[inline]
+    #[inline(always)]
+    fn home(&self, k: u128) -> (usize, usize, usize) {
+        let h = mix(k);
+        let base = ((h >> (64 - SBITS)) as usize) << self.rbits;
+        let m = (1usize << self.rbits) - 1;
+        (base, (h as usize) & m, m)
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u128) {
+        let (base, i, _) = self.home(k);
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch(self.slots.as_ptr().add(base + i) as *const i8, _MM_HINT_T0);
+        }
+    }
+    #[inline(always)]
     fn person(&self, k: u128) -> u128 {
-        let s = (mix(k) >> (64 - SBITS)) as usize;
-        self.shards[s].get(&k).copied().unwrap_or(k)
+        let (base, mut i, m) = self.home(k);
+        loop {
+            let (kk, v) = unsafe { *self.slots.get_unchecked(base + i) };
+            if kk == k {
+                return v;
+            }
+            if kk == 0 {
+                return k;
+            }
+            i = (i + 1) & m;
+        }
     }
 }
 
 struct Ctx {
     ws: i64,
     we: i64,
-    product: KeyMap<u16>,
+    product: IdLookup<u16>,
     unknown: u16,
     ncat: usize,
     cat_rank: Vec<u16>,
-    camp: KeyMap<u32>,
+    camp: IdLookup<u32>,
     ncamp: usize,
     link: LinkMap,
     day0: i64,
@@ -545,16 +747,24 @@ fn build_links(data: &Path, ncpu: usize) -> Res<(LinkMap, Vec<(u128, B)>)> {
             long_names.push((k, names[i as usize].1));
         }
     }
-    let shards: Vec<FxHashMap<u128, u128>> = by_shard
-        .into_par_iter()
-        .map(|v| {
-            let mut m = FxHashMap::default();
-            m.reserve(v.len());
-            m.extend(v);
-            m
-        })
-        .collect();
-    Ok((LinkMap { shards }, long_names))
+    let maxs = by_shard.iter().map(|v| v.len()).max().unwrap_or(0);
+    let rbits = ((maxs * 2).max(2)).next_power_of_two().trailing_zeros();
+    let rsize = 1usize << rbits;
+    let mut slots: Vec<(u128, u128)> = vec![(0, 0); rsize * NS];
+    slots
+        .par_chunks_mut(rsize)
+        .zip(by_shard.into_par_iter())
+        .for_each(|(region, v)| {
+            let m = rsize - 1;
+            for (k, p) in v {
+                let mut i = (mix(k) as usize) & m;
+                while region[i].0 != 0 {
+                    i = (i + 1) & m;
+                }
+                region[i] = (k, p);
+            }
+        });
+    Ok((LinkMap { slots, rbits }, long_names))
 }
 
 // ---------------------------------------------------------------- main
@@ -607,7 +817,7 @@ fn run() -> Res<()> {
     // products / categories
     let mut cat_names: Vec<B> = Vec::new();
     let mut cat_idx: FxHashMap<B, u16> = FxHashMap::default();
-    let mut product: KeyMap<u16> = KeyMap::new();
+    let mut product: IdLookup<u16> = IdLookup::new(b"p");
     for (p, c) in products {
         let ci = *cat_idx.entry(c).or_insert_with(|| {
             cat_names.push(c);
@@ -628,7 +838,7 @@ fn run() -> Res<()> {
     // campaigns
     let mut camp_ids: Vec<B> = Vec::new();
     let mut camp_ch: Vec<B> = Vec::new();
-    let mut camp: KeyMap<u32> = KeyMap::new();
+    let mut camp: IdLookup<u32> = IdLookup::new(b"c_");
     for (id, ch) in campaigns {
         if camp.get(id).is_none() {
             camp.insert_if_absent(id, camp_ids.len() as u32);
@@ -740,23 +950,72 @@ struct EvOut {
     long: Vec<(u128, B)>,
 }
 
+/// ingest_ts is always valid F1; fall back to the full parser if it is not 20 bytes.
+#[inline(always)]
+fn parse_ingest(b: &[u8]) -> i64 {
+    if b.len() == 20 {
+        let n = |i: usize| (b[i].wrapping_sub(b'0')) as i64;
+        let y = n(0) * 1000 + n(1) * 100 + n(2) * 10 + n(3);
+        let mo = n(5) * 10 + n(6);
+        let d = n(8) * 10 + n(9);
+        let secs = days_from_civil(y, mo, d) * 86_400
+            + (n(11) * 10 + n(12)) * 3600
+            + (n(14) * 10 + n(15)) * 60
+            + n(17) * 10
+            + n(18);
+        secs * 1000
+    } else {
+        parse_ts(b).unwrap_or(i64::MAX)
+    }
+}
+
+const BATCH: usize = 16;
+
+#[derive(Clone, Copy)]
+struct Pend {
+    ukey: u128,
+    user: B,
+    ts: u32,
+    price: u32,
+    rec: u32,
+    cat: u16,
+    kind: u8,
+}
+
+#[inline(always)]
+fn flush_events(pend: &[Pend], ctx: &Ctx, person: &mut [Vec<PRec>], long: &mut Vec<(u128, B)>) {
+    for p in pend {
+        let pkey = ctx.link.person(p.ukey);
+        if pkey == p.ukey && is_long(pkey) {
+            long.push((pkey, p.user));
+        }
+        person[(mix(pkey) >> (64 - PBITS)) as usize].push(PRec {
+            pkey,
+            ts: p.ts,
+            price: p.price,
+            rec: p.rec,
+            cat: p.cat,
+            kind: p.kind,
+        });
+    }
+}
+
 fn parse_events(c: &Chunk, ctx: &Ctx) -> EvOut {
     let est = c.data.len() / 70 + 16;
     let mut dedup: Vec<Vec<DRec>> = (0..NE).map(|_| Vec::with_capacity(est / NE + est / NE / 4 + 4)).collect();
     let mut person: Vec<Vec<PRec>> = (0..NP).map(|_| Vec::with_capacity(est / NP + est / NP / 4 + 4)).collect();
     let mut long = Vec::new();
-    let mut f: [B; 7] = [&[]; 7];
     let mut rec = c.base;
-    for_each_line(c, |line| {
-        if !split(line, &mut f) {
-            return;
-        }
+    let limit = c.data.as_ptr() as usize + c.data.len();
+    let mut pend = [Pend { ukey: 0, user: &[], ts: 0, price: 0, rec: 0, cat: 0, kind: 0 }; BATCH];
+    let mut np = 0usize;
+    scan::<7>(c, |f| {
         let eid = f[0];
         if eid.is_empty() {
             return;
         }
-        let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
-        let key = key_of(eid);
+        let ingest = parse_ingest(f[3]);
+        let key = key_fast(eid, limit);
         dedup[(mix(key) >> (64 - EBITS)) as usize].push(DRec { key, ingest, rec });
         let r = rec;
         rec += 1;
@@ -789,32 +1048,33 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> EvOut {
             return;
         }
         let cat = ctx.product.get(f[5]).unwrap_or(ctx.unknown);
-        let ukey = key_of(user);
-        let pkey = ctx.link.person(ukey);
-        if pkey == ukey && is_long(ukey) {
-            long.push((ukey, user));
+        let ukey = key_fast(user, limit);
+        ctx.link.prefetch(ukey);
+        pend[np] = Pend { ukey, user, ts: (t - ctx.ws) as u32, price, rec: r, cat, kind };
+        np += 1;
+        if np == BATCH {
+            flush_events(&pend, ctx, &mut person, &mut long);
+            np = 0;
         }
-        person[(mix(pkey) >> (64 - PBITS)) as usize].push(PRec {
-            pkey,
-            ts: (t - ctx.ws) as u32,
-            price,
-            rec: r,
-            cat,
-            kind,
-        });
     });
+    flush_events(&pend[..np], ctx, &mut person, &mut long);
     EvOut { dedup, person, long }
 }
 
 fn parse_clicks(c: &Chunk, ctx: &Ctx) -> Vec<Vec<CRec>> {
     let est = c.data.len() / 40 + 16;
     let mut out: Vec<Vec<CRec>> = (0..NP).map(|_| Vec::with_capacity(est / NP + est / NP / 4 + 4)).collect();
-    let mut f: [B; 4] = [&[]; 4];
     let lo = ctx.ws - WEEK_MS;
-    for_each_line(c, |line| {
-        if !split(line, &mut f) {
-            return;
+    let limit = c.data.as_ptr() as usize + c.data.len();
+    let mut pend: [(u128, B, i64, u32); BATCH] = [(0, &[], 0, 0); BATCH];
+    let mut np = 0usize;
+    let flush = |pend: &[(u128, B, i64, u32)], out: &mut Vec<Vec<CRec>>| {
+        for &(ukey, cid, ts, camp) in pend {
+            let pkey = ctx.link.person(ukey);
+            out[(mix(pkey) >> (64 - PBITS)) as usize].push(CRec { pkey, cid, ts, camp });
         }
+    };
+    scan::<4>(c, |f| {
         let (cid, user) = (f[0], f[1]);
         if cid.is_empty() || user.is_empty() {
             return;
@@ -824,9 +1084,16 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx) -> Vec<Vec<CRec>> {
             return;
         }
         let Some(camp) = ctx.camp.get(f[2]) else { return };
-        let pkey = ctx.link.person(key_of(user));
-        out[(mix(pkey) >> (64 - PBITS)) as usize].push(CRec { pkey, cid, ts, camp });
+        let ukey = key_fast(user, limit);
+        ctx.link.prefetch(ukey);
+        pend[np] = (ukey, cid, ts, camp);
+        np += 1;
+        if np == BATCH {
+            flush(&pend, &mut out);
+            np = 0;
+        }
     });
+    flush(&pend[..np], &mut out);
     out
 }
 
