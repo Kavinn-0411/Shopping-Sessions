@@ -28,7 +28,7 @@ const DAY_MS: i64 = 86_400_000;
 const GAP_MS: i64 = 1_800_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const LATE_MS: i64 = DAY_MS;
-const EBITS: u32 = 10;
+const EBITS: u32 = 8;
 const NE: usize = 1 << EBITS; // eid buckets
 const PBITS: u32 = 8;
 const NP: usize = 1 << PBITS; // person buckets
@@ -486,7 +486,28 @@ fn split<const N: usize>(line: B, out: &mut [B; N]) -> bool {
 
 // ---------------------------------------------------------------- time
 
+/// Days from 1970-01-01 to the first of each month, 1970..2099 (index (y-1970)*12 + m-1).
+static MONTH_DAYS: std::sync::LazyLock<Vec<i64>> = std::sync::LazyLock::new(|| {
+    let mut v = Vec::with_capacity(130 * 12);
+    for y in 1970..2100 {
+        for m in 1..=12 {
+            v.push(days_from_civil_slow(y, m, 1));
+        }
+    }
+    v
+});
+
+#[inline(always)]
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let i = (y - 1970) * 12 + (m - 1);
+    if (0..130 * 12).contains(&i) && (1..=12).contains(&m) {
+        MONTH_DAYS[i as usize] + d - 1
+    } else {
+        days_from_civil_slow(y, m, d)
+    }
+}
+
+fn days_from_civil_slow(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
