@@ -480,15 +480,171 @@ fn populate(d: &[u8]) {
     }
 }
 
+/// A CSV file read with pread (no mapping: the bytes are copied piece by piece into a small
+/// per-thread buffer that stays in cache, and nothing large has to be faulted in or torn down).
+struct SrcFile {
+    path: PathBuf,
+    len: u64,
+}
+
+fn list_src(dir: &Path) -> Res<Vec<SrcFile>> {
+    let mut v = Vec::new();
+    for path in list_csv(dir) {
+        let len = std::fs::metadata(&path)?.len();
+        v.push(SrcFile { path, len });
+    }
+    Ok(v)
+}
+
+/// The lines of one file that start in [a, b), the file's first line (header) excluded.
 #[derive(Clone, Copy)]
-struct Chunk {
-    data: B,
+struct Task {
+    file: usize,
+    a: u64,
+    b: u64,
+    /// First record id of this task (events only).
+    base: u32,
+}
+
+fn make_tasks(files: &[SrcFile], target: u64) -> Vec<Task> {
+    let mut out = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        let mut a = 0;
+        while a < f.len {
+            let b = (a + target).min(f.len);
+            out.push(Task { file: i, a, b, base: 0 });
+            a = b;
+        }
+    }
+    out
+}
+
+fn task_target(files: &[SrcFile], ncpu: usize) -> u64 {
+    let total: u64 = files.iter().map(|f| f.len).sum();
+    (total / (ncpu as u64 * 6).max(1)).clamp(1 << 20, 64 << 20)
+}
+
+const PIECE: usize = 4 << 20;
+
+thread_local! {
+    static RBUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// pread until `buf` is full or the file ends; returns the bytes read.
+fn read_full(f: &File, buf: &mut [u8], mut off: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    let mut n = 0;
+    while n < buf.len() {
+        match f.read_at(&mut buf[n..], off) {
+            Ok(0) => break,
+            Ok(k) => {
+                n += k;
+                off += k as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
+}
+
+/// Call `f` with runs of whole lines covering exactly the task's lines. The slices are only
+/// valid during the call.
+fn read_task(files: &[SrcFile], t: &Task, mut f: impl FnMut(&[u8])) -> Res<()> {
+    let sf = &files[t.file];
+    let file = File::open(&sf.path)?;
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::unix::io::AsRawFd;
+        libc::posix_fadvise(file.as_raw_fd(), t.a as i64, (t.b - t.a) as i64 + (1 << 20), libc::POSIX_FADV_SEQUENTIAL);
+    }
+    RBUF.with(|cell| -> Res<()> {
+        let mut buf = cell.borrow_mut();
+        // Lines start at 0 and after each newline; the line at 0 is the header. The first line
+        // we own is the first one starting at or after max(a, 1): skip through the first
+        // newline at or after a - 1.
+        let mut off = t.a.saturating_sub(1);
+        let mut skipping = true;
+        let mut carry = 0usize;
+        loop {
+            if buf.len() < carry + PIECE {
+                buf.resize(carry + PIECE, 0);
+            }
+            let n = read_full(&file, &mut buf[carry..carry + PIECE], off)?;
+            let base = off - carry as u64; // file offset of buf[0]
+            off += n as u64;
+            let have = carry + n;
+            let eof = n < PIECE || off >= sf.len;
+            let mut s = 0usize;
+            if skipping {
+                match memchr(b'\n', &buf[..have]) {
+                    Some(i) => {
+                        s = i + 1;
+                        skipping = false;
+                    }
+                    None => {
+                        if eof {
+                            return Ok(());
+                        }
+                        carry = 0;
+                        continue;
+                    }
+                }
+            }
+            // Our lines start before b; `cut` is b in buffer coordinates.
+            let cut = t.b.saturating_sub(base);
+            if cut <= have as u64 {
+                let cut = cut as usize;
+                let end = if s >= cut {
+                    Some(s)
+                } else {
+                    match memchr(b'\n', &buf[cut - 1..have]) {
+                        Some(i) => Some(cut + i),
+                        None if eof => Some(have),
+                        None => None,
+                    }
+                };
+                if let Some(end) = end {
+                    if end > s {
+                        f(&buf[s..end]);
+                    }
+                    return Ok(());
+                }
+            }
+            let lim = if eof {
+                have
+            } else {
+                match memchr::memrchr(b'\n', &buf[s..have]) {
+                    Some(i) => s + i + 1,
+                    None => s,
+                }
+            };
+            if lim > s {
+                f(&buf[s..lim]);
+            }
+            if eof {
+                return Ok(());
+            }
+            buf.copy_within(lim..have, 0);
+            carry = have - lim;
+        }
+    })
+}
+
+/// Copy bytes that must outlive the read buffer.
+fn keep(b: &[u8]) -> B {
+    Box::leak(b.to_vec().into_boxed_slice())
+}
+
+#[derive(Clone, Copy)]
+struct Chunk<'a> {
+    data: &'a [u8],
     skip_first: bool,
     /// First record id of this chunk (events only).
     base: u32,
 }
 
-fn make_chunks(files: &[B], target: usize) -> Vec<Chunk> {
+fn make_chunks(files: &[B], target: usize) -> Vec<Chunk<'static>> {
     let mut out = Vec::new();
     for &f in files {
         let n = f.len();
@@ -516,7 +672,7 @@ fn chunk_target(files: &[B], ncpu: usize) -> usize {
 }
 
 #[inline]
-fn for_each_line(c: &Chunk, mut f: impl FnMut(B)) {
+fn for_each_line<'a>(c: &Chunk<'a>, mut f: impl FnMut(&'a [u8])) {
     let d = c.data;
     let mut pos = 0;
     if c.skip_first {
@@ -569,7 +725,7 @@ fn masks64(p: *const u8) -> (u64, u64, u64) {
 /// formed when every field either has no quote or starts and ends with one (length >= 2), and
 /// the line holds no other quotes (its quote count is twice the number of quoted fields).
 #[inline(always)]
-fn scan<const N: usize>(c: &Chunk, mut on_line: impl FnMut(&[B; N])) {
+fn scan<'a, const N: usize>(c: &Chunk<'a>, mut on_line: impl FnMut(&[&'a [u8]; N])) {
     debug_assert!(N >= 1 && N <= 8);
     let d = c.data;
     let end = d.len();
@@ -598,7 +754,7 @@ fn scan<const N: usize>(c: &Chunk, mut on_line: impl FnMut(&[B; N])) {
             let p: usize = $p;
             if nf == N - 1 {
                 let lq: u64 = $q - q_ls;
-                let mut fields: [B; N] = [&[]; N];
+                let mut fields: [&'a [u8]; N] = [&[]; N];
                 let mut s = ls;
                 let mut bad = false;
                 let mut nq = 0u64;
@@ -869,7 +1025,7 @@ struct PRec {
 #[derive(Clone, Copy)]
 struct CRec {
     pkey: u64,
-    cid: B,
+    cid: u64,
     ts: i64,
     camp: u32,
 }
@@ -977,32 +1133,32 @@ fn shard_of(k: u64) -> usize {
 /// Returns the id-key -> person-key map and the bytes of long person names.
 fn build_links(data: &Path, ncpu: usize) -> Res<(LinkMap, Vec<(u64, B)>)> {
     let tl = Instant::now();
-    let files = map_dir(&data.join("links"))?;
-    let chunks = make_chunks(&files, chunk_target(&files, ncpu).min(4 << 20));
+    let files = list_src(&data.join("links"))?;
+    let tasks = make_tasks(&files, task_target(&files, ncpu).min(4 << 20));
     // parse straight into key pairs; long ids keep their bytes on the side
-    let parsed: Vec<(Vec<(u64, u64)>, Vec<(u64, B)>)> = chunks
+    let parsed: Vec<(Vec<(u64, u64)>, Vec<(u64, B)>)> = tasks
         .par_iter()
-        .map(|c| {
-            let limit = c.data.as_ptr() as usize + c.data.len();
-            let mut edges = Vec::with_capacity(c.data.len() / 20);
+        .map(|t| -> Res<_> {
+            let mut edges = Vec::with_capacity(((t.b - t.a) / 20) as usize);
             let mut long = Vec::new();
-            scan::<2>(c, |f| {
+            let mut on_line = |f: &[&[u8]; 2]| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
-                let a = key_fast(f[0], limit);
-                let b = key_fast(f[1], limit);
+                let a = key_of(f[0]);
+                let b = key_of(f[1]);
                 if is_long(a) {
-                    long.push((a, f[0]));
+                    long.push((a, keep(f[0])));
                 }
                 if is_long(b) {
-                    long.push((b, f[1]));
+                    long.push((b, keep(f[1])));
                 }
                 edges.push((a, b));
-            });
-            (edges, long)
+            };
+            read_task(&files, t, |piece| scan::<2>(&Chunk { data: piece, skip_first: false, base: 0 }, &mut on_line))?;
+            Ok((edges, long))
         })
-        .collect();
+        .collect::<Res<Vec<_>>>()?;
     let mut long: FxHashMap<u64, B> = FxHashMap::default();
     for (_, l) in &parsed {
         long.extend(l.iter().copied());
@@ -1157,7 +1313,7 @@ fn run() -> Res<()> {
                         load_lookup(&data.join("campaigns.csv"))?,
                     ))
                 },
-                || -> Res<_> { Ok((map_dir(&data.join("events"))?, map_dir(&data.join("clicks"))?)) },
+                || -> Res<_> { Ok((list_src(&data.join("events"))?, list_src(&data.join("clicks"))?)) },
             )
         },
     );
@@ -1216,25 +1372,34 @@ fn run() -> Res<()> {
         nd,
     });
 
-    // ---- chunking; each event chunk gets a disjoint record-id range
-    let mut ev_chunks = make_chunks(&ev_files, chunk_target(&ev_files, ncpu));
+    // ---- tasks; each event task gets a disjoint record-id range
+    let mut ev_tasks = make_tasks(&ev_files, task_target(&ev_files, ncpu));
     let mut next: u64 = 0;
-    for c in ev_chunks.iter_mut() {
-        c.base = next as u32;
+    for t in ev_tasks.iter_mut() {
+        t.base = next as u32;
         // a record line holds at least 27 bytes plus its newline
-        next += (c.data.len() / 20 + 2) as u64;
+        next += (t.b - t.a) / 20 + 2;
     }
     if next > u32::MAX as u64 {
         return Err("too many records".into());
     }
     let nrec = next as usize;
-    let ck_chunks = make_chunks(&ck_files, chunk_target(&ck_files, ncpu));
+    let ck_tasks = make_tasks(&ck_files, task_target(&ck_files, ncpu));
 
     // ---- parse events and clicks
     let (parsed, clicks) = rayon::join(
-        || ev_chunks.par_iter().map(|c| parse_events(c, &ctx)).collect::<Vec<_>>(),
-        || ck_chunks.par_iter().map(|c| parse_clicks(c, &ctx)).collect::<Vec<_>>(),
+        || ev_tasks.par_iter().map(|t| parse_events(&ev_files, t, &ctx)).collect::<Res<Vec<_>>>(),
+        || ck_tasks.par_iter().map(|t| parse_clicks(&ck_files, t, &ctx)).collect::<Res<Vec<_>>>(),
     );
+    let (parsed, clicks) = (parsed?, clicks?);
+    let mut lcid: FxHashMap<u64, B> = FxHashMap::default();
+    let clicks: Vec<Vec<Vec<CRec>>> = clicks
+        .into_iter()
+        .map(|(c, l)| {
+            lcid.extend(l);
+            c
+        })
+        .collect();
     eprintln!("[{:?}] parsed", t0.elapsed());
 
     // ---- dedup per eid bucket -> winner bitmap
@@ -1248,7 +1413,7 @@ fn run() -> Res<()> {
     long.extend(long_link);
     for p in &parsed {
         for &(k, s) in &p.long {
-            long.entry(k).or_insert_with(|| Box::leak(s.to_vec().into_boxed_slice()));
+            long.entry(k).or_insert(s);
         }
     }
     // Free what later stages no longer need in the background, so less is left to tear down
@@ -1256,17 +1421,7 @@ fn run() -> Res<()> {
     let mut parsed = parsed;
     if std::env::var_os("NOBG").is_none() {
         let dedup_bufs: Vec<Vec<Vec<DRec>>> = parsed.iter_mut().map(|p| std::mem::take(&mut p.dedup)).collect();
-        let maps: Vec<(usize, usize)> = ev_files.iter().map(|f| (f.as_ptr() as usize, f.len())).collect();
-        std::thread::spawn(move || {
-            drop(dedup_bufs);
-            for (ptr, len) in maps {
-                if len > 0 {
-                    unsafe {
-                        libc::munmap(ptr as *mut libc::c_void, len);
-                    }
-                }
-            }
-        });
+        std::thread::spawn(move || drop(dedup_bufs));
     }
     let parsed = parsed;
 
@@ -1277,7 +1432,7 @@ fn run() -> Res<()> {
         let t = rayon::current_thread_index().unwrap_or(0) % nthreads;
         let mut g = slots[t].lock().unwrap();
         let st = g.get_or_insert_with(|| PState::new(&ctx));
-        person_bucket(b, &parsed, &clicks, &winners, &ctx, st);
+        person_bucket(b, &parsed, &clicks, &winners, &ctx, &lcid, st);
     });
     let states: Vec<PState> = slots.into_iter().filter_map(|m| m.into_inner().unwrap()).collect();
     eprintln!("[{:?}] sessions ({} states)", t0.elapsed(), states.len());
@@ -1420,23 +1575,21 @@ fn flush_events(pend: &[Pend], ctx: &Ctx, person: &mut Wc<PRec, WC>, long: &mut 
     }
 }
 
-fn parse_events(c: &Chunk, ctx: &Ctx) -> EvOut {
-    populate(c.data);
-    let est = c.data.len() / 70 + 16;
+fn parse_events(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<EvOut> {
+    let est = ((t.b - t.a) / 70) as usize + 16;
     let mut dedup: Wc<DRec, WC> = Wc::new(NE, est / NE + est / NE / 4 + 16, DEMPTY);
     let mut person: Wc<PRec, WC> = Wc::new(NP, est / NP + est / NP / 4 + 16, PZERO);
     let mut long = Vec::new();
-    let mut rec = c.base;
-    let limit = c.data.as_ptr() as usize + c.data.len();
+    let mut rec = t.base;
     let mut pend = [Pend { ukey: 0, user: &[], ts: 0, price: 0, rec: 0, cat: 0, kind: 0 }; BATCH];
     let mut np = 0usize;
-    scan::<7>(c, |f| {
+    let mut on_line = |f: &[&[u8]; 7]| {
         let eid = f[0];
         if eid.is_empty() {
             return;
         }
         let ingest = parse_ingest(f[3]);
-        let key = key_fast(eid, limit);
+        let key = key_of(eid);
         dedup.push((mix(key) >> (64 - EBITS)) as usize, DRec {
             key,
             ingest: (ingest / 1000).clamp(0, u32::MAX as i64) as u32,
@@ -1473,34 +1626,36 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> EvOut {
             return;
         }
         let cat = ctx.product.get(f[5]).unwrap_or(ctx.unknown);
-        let ukey = key_fast(user, limit);
+        let ukey = key_of(user);
         ctx.link.prefetch(ukey);
+        // long ids keep their bytes (the read buffer is reused)
+        let user: B = if is_long(ukey) { keep(user) } else { &[] };
         pend[np] = Pend { ukey, user, ts: (t - ctx.ws) as u32, price, rec: r, cat, kind };
         np += 1;
         if np == BATCH {
             flush_events(&pend, ctx, &mut person, &mut long);
             np = 0;
         }
-    });
+    };
+    read_task(files, t, |piece| scan::<7>(&Chunk { data: piece, skip_first: false, base: 0 }, &mut on_line))?;
     flush_events(&pend[..np], ctx, &mut person, &mut long);
-    EvOut { dedup: dedup.finish(), person: person.finish(), long }
+    Ok(EvOut { dedup: dedup.finish(), person: person.finish(), long })
 }
 
-fn parse_clicks(c: &Chunk, ctx: &Ctx) -> Vec<Vec<CRec>> {
-    populate(c.data);
-    let est = c.data.len() / 40 + 16;
+fn parse_clicks(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<(Vec<Vec<CRec>>, Vec<(u64, B)>)> {
+    let est = ((t.b - t.a) / 40) as usize + 16;
     let mut out: Vec<Vec<CRec>> = (0..NP).map(|_| Vec::with_capacity(est / NP + est / NP / 4 + 4)).collect();
+    let mut long = Vec::new();
     let lo = ctx.ws - WEEK_MS;
-    let limit = c.data.as_ptr() as usize + c.data.len();
-    let mut pend: [(u64, B, i64, u32); BATCH] = [(0, &[], 0, 0); BATCH];
+    let mut pend: [(u64, u64, i64, u32); BATCH] = [(0, 0, 0, 0); BATCH];
     let mut np = 0usize;
-    let flush = |pend: &[(u64, B, i64, u32)], out: &mut Vec<Vec<CRec>>| {
+    let flush = |pend: &[(u64, u64, i64, u32)], out: &mut Vec<Vec<CRec>>| {
         for &(ukey, cid, ts, camp) in pend {
             let pkey = ctx.link.person(ukey);
             out[(mix(pkey) >> (64 - PBITS)) as usize].push(CRec { pkey, cid, ts, camp });
         }
     };
-    scan::<4>(c, |f| {
+    let mut on_line = |f: &[&[u8]; 4]| {
         let (cid, user) = (f[0], f[1]);
         if cid.is_empty() || user.is_empty() {
             return;
@@ -1510,17 +1665,22 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx) -> Vec<Vec<CRec>> {
             return;
         }
         let Some(camp) = ctx.camp.get(f[2]) else { return };
-        let ukey = key_fast(user, limit);
+        let ukey = key_of(user);
+        let ck = key_of(cid);
+        if is_long(ck) {
+            long.push((ck, keep(cid)));
+        }
         ctx.link.prefetch(ukey);
-        pend[np] = (ukey, cid, ts, camp);
+        pend[np] = (ukey, ck, ts, camp);
         np += 1;
         if np == BATCH {
             flush(&pend, &mut out);
             np = 0;
         }
-    });
+    };
+    read_task(files, t, |piece| scan::<4>(&Chunk { data: piece, skip_first: false, base: 0 }, &mut on_line))?;
     flush(&pend[..np], &mut out);
-    out
+    Ok((out, long))
 }
 
 thread_local! {
@@ -1587,7 +1747,7 @@ struct PState {
     evs: Vec<(u32, u32, u16, u8)>, // ts, price, cat, kind
     cids: Vec<u32>,
     cstart: Vec<u32>,
-    cks: Vec<(i64, B, u32)>, // ts, click_id, campaign
+    cks: Vec<(i64, u64, u32)>, // ts, click_id, campaign
     cnt: Vec<u32>,
     apos: Vec<u32>,
     active: Vec<u32>,
@@ -1637,7 +1797,15 @@ fn group_starts(ids: &[u32], ngroups: usize, start: &mut Vec<u32>, fill: &mut Ve
     start[ngroups] as usize
 }
 
-fn person_bucket(b: usize, parsed: &[EvOut], clicks: &[Vec<Vec<CRec>>], winners: &[AtomicU64], ctx: &Ctx, st: &mut PState) {
+fn person_bucket(
+    b: usize,
+    parsed: &[EvOut],
+    clicks: &[Vec<Vec<CRec>>],
+    winners: &[AtomicU64],
+    ctx: &Ctx,
+    lcid: &FxHashMap<u64, B>,
+    st: &mut PState,
+) {
     let nd = ctx.nd;
     let organic = ctx.ncamp;
     let PState {
@@ -1702,7 +1870,7 @@ fn person_bucket(b: usize, parsed: &[EvOut], clicks: &[Vec<Vec<CRec>>], winners:
     }
     let cn = group_starts(cids, np, cstart, fill);
     cks.clear();
-    cks.resize(cn, (0, &[], 0));
+    cks.resize(cn, (0, 0, 0));
     let mut x = 0;
     for c in clicks {
         for k in &c[b] {
@@ -1741,7 +1909,15 @@ fn person_bucket(b: usize, parsed: &[EvOut], clicks: &[Vec<Vec<CRec>>], winners:
         ev.sort_unstable_by_key(|e| e.0);
         let ck = &mut cks[cstart[p] as usize..cstart[p + 1] as usize];
         if ck.len() > 1 {
-            ck.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            ck.sort_unstable_by(|a, b| {
+                a.0.cmp(&b.0).then_with(|| {
+                    if !is_long(a.1) && !is_long(b.1) {
+                        a.1.cmp(&b.1)
+                    } else {
+                        key_bytes(a.1, lcid).cmp(&key_bytes(b.1, lcid))
+                    }
+                })
+            });
         }
         let pkey = pkeys[p];
         let mut lo = 0usize;
