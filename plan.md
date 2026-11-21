@@ -47,11 +47,11 @@ aggregate ─► user_daily / campaign_daily ─► Parquet (day = DATE)
 ## Phases
 
 ### Phase 1: correct v1 (target: first submission)
-- [ ] Project skeleton: Cargo, multi-stage Dockerfile (`rust` builder → `scratch` runtime), fixtures, scripts
-- [ ] Build the generator in Docker; generate `dev/` (seed 1, 1M events and 250k clicks)
-- [ ] v1 pipeline: straightforward and parallel (one chunk of work per file, std hash maps, sort)
-- [ ] Minimal Parquet writer (or the `parquet` crate) with `day` as DATE
-- [ ] Pass all 36 fixtures and `check-dev`
+- [x] Project skeleton: Cargo, multi-stage Dockerfile (`rust` builder → `scratch` runtime), fixtures, scripts
+- [x] Build the generator in Docker; generate `dev/` (seed 1, 1M events and 250k clicks)
+- [x] v1 pipeline: straightforward and parallel (one chunk of work per file, std hash maps, sort)
+- [x] Minimal Parquet writer (or the `parquet` crate) with `day` as DATE
+- [x] Pass all 36 fixtures and `check-dev`
 - [ ] Commit, push to a public GitHub repo, submit
 
 ### Phase 2: safety net
@@ -77,3 +77,4 @@ aggregate ─► user_daily / campaign_daily ─► Parquet (day = DATE)
 
 | Commit | Change | Local dev time | Practice time |
 | --- | --- | --- | --- |
+| v1 | Correct parallel baseline: 36/36 fixtures, dev MATCH | ~160 ms (1M, warm) | |
