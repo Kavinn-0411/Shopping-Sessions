@@ -34,7 +34,6 @@ const PBITS: u32 = 8;
 const NP: usize = 1 << PBITS; // person buckets
 const SBITS: u32 = 8;
 const NS: usize = 1 << SBITS; // link map shards
-const USER_FILES: usize = 16;
 
 type B = &'static [u8];
 type Res<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -219,7 +218,11 @@ fn map_file(p: &Path) -> Res<B> {
     if f.metadata()?.len() == 0 {
         return Ok(&[]);
     }
-    let m = unsafe { Mmap::map(&f)? };
+    let m = if std::env::var_os("NOPOP").is_some() {
+        unsafe { Mmap::map(&f)? }
+    } else {
+        unsafe { memmap2::MmapOptions::new().populate().map(&f)? }
+    };
     let m: &'static Mmap = Box::leak(Box::new(m));
     Ok(&m[..])
 }
@@ -564,10 +567,13 @@ fn manifest_value(text: &str, key: &str) -> Option<i64> {
 /// Dedup entry: one per parsed event line with a non-empty event_id.
 #[derive(Clone, Copy)]
 struct DRec {
-    key: u128,
-    ingest: i64,
+    hi: u64,
+    lo: u64,
+    ingest: u32, // epoch seconds (ingest_ts is whole-second F1)
     rec: u32,
 }
+
+const DEMPTY: DRec = DRec { hi: 0, lo: 0, ingest: 0, rec: 0 };
 
 /// A valid (validated, not late) event, routed by person.
 #[derive(Clone, Copy)]
@@ -691,6 +697,7 @@ fn build_links(data: &Path, ncpu: usize) -> Res<(LinkMap, Vec<(u128, B)>)> {
             v
         })
         .collect();
+    let tl = Instant::now();
     let edges: Vec<(B, B)> = pairs.into_iter().flatten().collect();
     let ne = edges.len();
     // Intern by sorting (key, bytes, slot) in byte order; ids come out in byte order.
@@ -726,6 +733,7 @@ fn build_links(data: &Path, ncpu: usize) -> Res<(LinkMap, Vec<(u128, B)>)> {
         slot_id[it.2 as usize] = (names.len() - 1) as u32;
     }
     drop(items);
+    eprintln!("  links: parsed+interned {} edges in {:?} (since flatten)", ne, tl.elapsed());
     let n = names.len();
     let mut parent: Vec<u32> = (0..n as u32).collect();
     for e in 0..ne {
@@ -898,35 +906,39 @@ fn run() -> Res<()> {
     }
 
     // ---- sessionize + attribute per person bucket
-    let results: Vec<(Vec<URow>, Vec<[u64; 4]>)> = (0..NP)
-        .into_par_iter()
-        .map(|b| person_bucket(b, &parsed, &clicks, &winners, &ctx))
-        .collect();
-    eprintln!("[{:?}] sessions", t0.elapsed());
+    let nthreads = rayon::current_num_threads();
+    let slots: Vec<std::sync::Mutex<Option<PState>>> = (0..nthreads).map(|_| std::sync::Mutex::new(None)).collect();
+    (0..NP).into_par_iter().with_max_len(1).for_each(|b| {
+        let t = rayon::current_thread_index().unwrap_or(0) % nthreads;
+        let mut g = slots[t].lock().unwrap();
+        let st = g.get_or_insert_with(|| PState::new(&ctx));
+        person_bucket(b, &parsed, &clicks, &winners, &ctx, st);
+    });
+    let states: Vec<PState> = slots.into_iter().filter_map(|m| m.into_inner().unwrap()).collect();
+    eprintln!("[{:?}] sessions ({} states)", t0.elapsed(), states.len());
 
     let mut camp_agg = vec![[0u64; 4]; (ncamp + 1) * nd];
-    let mut user_parts: Vec<Vec<URow>> = Vec::with_capacity(NP);
-    for (u, c) in results {
-        user_parts.push(u);
-        for (a, x) in camp_agg.iter_mut().zip(c.iter()) {
+    let mut user_parts: Vec<Vec<URow>> = Vec::with_capacity(states.len());
+    for st in states {
+        for (a, x) in camp_agg.iter_mut().zip(st.camp_agg.iter()) {
             for k in 0..4 {
                 a[k] += x[k];
             }
         }
+        user_parts.push(st.users);
     }
 
     let ud = out.join("user_daily");
     let cd = out.join("campaign_daily");
     std::fs::create_dir_all(&ud)?;
     std::fs::create_dir_all(&cd)?;
-    let per = NP / USER_FILES;
     let nuser: usize = user_parts.iter().map(|u| u.len()).sum();
     let (r1, r2) = rayon::join(
         || {
-            (0..USER_FILES).into_par_iter().try_for_each(|f| {
+            user_parts.par_iter().enumerate().try_for_each(|(f, part)| {
                 write_users(
                     &ud.join(format!("part-{f:03}.parquet")),
-                    &user_parts[f * per..(f + 1) * per],
+                    std::slice::from_ref(part),
                     &cat_names,
                     &long,
                 )
@@ -1016,7 +1028,12 @@ fn parse_events(c: &Chunk, ctx: &Ctx) -> EvOut {
         }
         let ingest = parse_ingest(f[3]);
         let key = key_fast(eid, limit);
-        dedup[(mix(key) >> (64 - EBITS)) as usize].push(DRec { key, ingest, rec });
+        dedup[(mix(key) >> (64 - EBITS)) as usize].push(DRec {
+            hi: (key >> 64) as u64,
+            lo: key as u64,
+            ingest: (ingest / 1000).clamp(0, u32::MAX as i64) as u32,
+            rec,
+        });
         let r = rec;
         rec += 1;
         // validation
@@ -1097,39 +1114,52 @@ fn parse_clicks(c: &Chunk, ctx: &Ctx) -> Vec<Vec<CRec>> {
     out
 }
 
+thread_local! {
+    static DTABLE: std::cell::RefCell<Vec<DRec>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn dedup_bucket(b: usize, parsed: &[EvOut], winners: &[AtomicU64]) {
     let total: usize = parsed.iter().map(|p| p.dedup[b].len()).sum();
     if total == 0 {
         return;
     }
-    let cap = (total * 2).next_power_of_two();
+    let cap = (total + total / 2).next_power_of_two();
     let mask = cap - 1;
-    let mut table: Vec<DRec> = vec![DRec { key: 0, ingest: 0, rec: 0 }; cap];
-    for p in parsed {
-        for d in &p.dedup[b] {
-            let mut i = (mix(d.key) as usize) & mask;
-            loop {
-                let t = &mut table[i];
-                if t.key == 0 {
-                    *t = *d;
-                    break;
-                }
-                if t.key == d.key {
-                    if d.ingest < t.ingest {
-                        t.ingest = d.ingest;
-                        t.rec = d.rec;
+    DTABLE.with(|cell| {
+        let mut tab = cell.borrow_mut();
+        if tab.len() < cap {
+            tab.resize(cap, DEMPTY);
+        }
+        // invariant: the table is all-empty between buckets
+        let table = &mut tab[..cap];
+        for p in parsed {
+            for d in &p.dedup[b] {
+                let key = ((d.hi as u128) << 64) | d.lo as u128;
+                let mut i = (mix(key) as usize) & mask;
+                loop {
+                    let t = &mut table[i];
+                    if t.hi == 0 && t.lo == 0 {
+                        *t = *d;
+                        break;
                     }
-                    break;
+                    if t.hi == d.hi && t.lo == d.lo {
+                        if d.ingest < t.ingest {
+                            t.ingest = d.ingest;
+                            t.rec = d.rec;
+                        }
+                        break;
+                    }
+                    i = (i + 1) & mask;
                 }
-                i = (i + 1) & mask;
             }
         }
-    }
-    for t in &table {
-        if t.key != 0 {
-            winners[(t.rec >> 6) as usize].fetch_or(1u64 << (t.rec & 63), Ordering::Relaxed);
+        for t in table.iter_mut() {
+            if t.hi != 0 || t.lo != 0 {
+                winners[(t.rec >> 6) as usize].fetch_or(1u64 << (t.rec & 63), Ordering::Relaxed);
+                *t = DEMPTY;
+            }
         }
-    }
+    });
 }
 
 #[inline]
@@ -1137,83 +1167,146 @@ fn is_winner(w: &[AtomicU64], rec: u32) -> bool {
     w[(rec >> 6) as usize].load(Ordering::Relaxed) & (1u64 << (rec & 63)) != 0
 }
 
-fn person_bucket(
-    b: usize,
-    parsed: &[EvOut],
-    clicks: &[Vec<Vec<CRec>>],
-    winners: &[AtomicU64],
-    ctx: &Ctx,
-) -> (Vec<URow>, Vec<[u64; 4]>) {
+/// Per-thread state for the person stage; buffers are reused across buckets.
+struct PState {
+    camp_agg: Vec<[u64; 4]>,
+    users: Vec<URow>,
+    pid_of: FxHashMap<u128, u32>,
+    pkeys: Vec<u128>,
+    ids: Vec<u32>,
+    start: Vec<u32>,
+    fill: Vec<u32>,
+    evs: Vec<(u32, u32, u16, u8)>, // ts, price, cat, kind
+    cids: Vec<u32>,
+    cstart: Vec<u32>,
+    cks: Vec<(i64, B, u32)>, // ts, click_id, campaign
+    cnt: Vec<u32>,
+    apos: Vec<u32>,
+    active: Vec<u32>,
+    catsum: Vec<u64>,
+    touched: Vec<u16>,
+}
+
+impl PState {
+    fn new(ctx: &Ctx) -> Self {
+        PState {
+            camp_agg: vec![[0u64; 4]; (ctx.ncamp + 1) * ctx.nd],
+            users: Vec::new(),
+            pid_of: FxHashMap::default(),
+            pkeys: Vec::new(),
+            ids: Vec::new(),
+            start: Vec::new(),
+            fill: Vec::new(),
+            evs: Vec::new(),
+            cids: Vec::new(),
+            cstart: Vec::new(),
+            cks: Vec::new(),
+            cnt: vec![0; ctx.ncamp],
+            apos: vec![0; ctx.ncamp],
+            active: Vec::new(),
+            catsum: vec![0; ctx.ncat],
+            touched: Vec::new(),
+        }
+    }
+}
+
+const NONE: u32 = u32::MAX;
+
+/// Counting sort setup: group starts from ids (NONE = skipped); `fill` gets per-group cursors.
+fn group_starts(ids: &[u32], ngroups: usize, start: &mut Vec<u32>, fill: &mut Vec<u32>) -> usize {
+    start.clear();
+    start.resize(ngroups + 1, 0);
+    for &id in ids {
+        if id != NONE {
+            start[id as usize + 1] += 1;
+        }
+    }
+    for i in 0..ngroups {
+        start[i + 1] += start[i];
+    }
+    fill.clear();
+    fill.extend_from_slice(&start[..ngroups]);
+    start[ngroups] as usize
+}
+
+fn person_bucket(b: usize, parsed: &[EvOut], clicks: &[Vec<Vec<CRec>>], winners: &[AtomicU64], ctx: &Ctx, st: &mut PState) {
     let nd = ctx.nd;
     let organic = ctx.ncamp;
-    let mut camp_agg = vec![[0u64; 4]; (ctx.ncamp + 1) * nd];
-    let mut users: Vec<URow> = Vec::new();
+    let PState {
+        camp_agg,
+        users,
+        pid_of,
+        pkeys,
+        ids,
+        start,
+        fill,
+        evs,
+        cids,
+        cstart,
+        cks,
+        cnt,
+        apos,
+        active,
+        catsum,
+        touched,
+    } = st;
 
-    // gather surviving events, assign local person ids
-    let total: usize = parsed.iter().map(|p| p.person[b].len()).sum();
-    let mut pid_of: FxHashMap<u128, u32> = FxHashMap::default();
-    let mut pkeys: Vec<u128> = Vec::new();
-    let mut tmp: Vec<(u32, PRec)> = Vec::with_capacity(total);
+    // pass 1: surviving events -> local person ids
+    pid_of.clear();
+    pkeys.clear();
+    ids.clear();
     for p in parsed {
         for e in &p.person[b] {
             if !is_winner(winners, e.rec) {
+                ids.push(NONE);
                 continue;
             }
             let id = *pid_of.entry(e.pkey).or_insert_with(|| {
                 pkeys.push(e.pkey);
                 (pkeys.len() - 1) as u32
             });
-            tmp.push((id, *e));
+            ids.push(id);
         }
     }
     let np = pkeys.len();
-    // counting sort by person
-    let mut start = vec![0u32; np + 1];
-    for (id, _) in &tmp {
-        start[*id as usize + 1] += 1;
-    }
-    for i in 0..np {
-        start[i + 1] += start[i];
-    }
-    let mut fill = start.clone();
-    let mut evs: Vec<(u32, u32, u32, u16, u8)> = vec![(0, 0, 0, 0, 0); tmp.len()]; // ts, price, -, cat, kind
-    for (id, e) in &tmp {
-        let at = &mut fill[*id as usize];
-        evs[*at as usize] = (e.ts, e.price, 0, e.cat, e.kind);
-        *at += 1;
-    }
-    drop(tmp);
-
-    // clicks of known persons, grouped the same way
-    let mut ctmp: Vec<(u32, i64, B, u32)> = Vec::new();
-    for c in clicks {
-        for k in &c[b] {
-            if let Some(&id) = pid_of.get(&k.pkey) {
-                ctmp.push((id, k.ts, k.cid, k.camp));
+    let n = group_starts(ids, np, start, fill);
+    evs.clear();
+    evs.resize(n, (0, 0, 0, 0));
+    let mut x = 0;
+    for p in parsed {
+        for e in &p.person[b] {
+            let id = ids[x];
+            x += 1;
+            if id != NONE {
+                let at = &mut fill[id as usize];
+                evs[*at as usize] = (e.ts, e.price, e.cat, e.kind);
+                *at += 1;
             }
         }
     }
-    let mut cstart = vec![0u32; np + 1];
-    for c in &ctmp {
-        cstart[c.0 as usize + 1] += 1;
-    }
-    for i in 0..np {
-        cstart[i + 1] += cstart[i];
-    }
-    let mut cfill = cstart.clone();
-    let mut cks: Vec<(i64, B, u32)> = vec![(0, &[], 0); ctmp.len()];
-    for c in &ctmp {
-        let at = &mut cfill[c.0 as usize];
-        cks[*at as usize] = (c.1, c.2, c.3);
-        *at += 1;
-    }
-    drop(ctmp);
 
-    let mut cnt = vec![0u32; ctx.ncamp];
-    let mut apos = vec![0u32; ctx.ncamp];
-    let mut active: Vec<u32> = Vec::new();
-    let mut catsum = vec![0u64; ctx.ncat];
-    let mut touched: Vec<u16> = Vec::new();
+    // clicks of known persons, grouped the same way
+    cids.clear();
+    for c in clicks {
+        for k in &c[b] {
+            cids.push(pid_of.get(&k.pkey).copied().unwrap_or(NONE));
+        }
+    }
+    let cn = group_starts(cids, np, cstart, fill);
+    cks.clear();
+    cks.resize(cn, (0, &[], 0));
+    let mut x = 0;
+    for c in clicks {
+        for k in &c[b] {
+            let id = cids[x];
+            x += 1;
+            if id != NONE {
+                let at = &mut fill[id as usize];
+                cks[*at as usize] = (k.ts, k.cid, k.camp);
+                *at += 1;
+            }
+        }
+    }
 
     let add = |c: u32, cnt: &mut Vec<u32>, apos: &mut Vec<u32>, active: &mut Vec<u32>| {
         let c = c as usize;
@@ -1236,25 +1329,19 @@ fn person_bucket(
     };
 
     for p in 0..np {
-        let (i, j) = (start[p] as usize, start[p + 1] as usize);
-        let ev = &mut evs[i..j];
+        let ev = &mut evs[start[p] as usize..start[p + 1] as usize];
         ev.sort_unstable_by_key(|e| e.0);
-        let (ci, cj) = (cstart[p] as usize, cstart[p + 1] as usize);
-        let ck = &mut cks[ci..cj];
-        ck.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        let ck = &mut cks[cstart[p] as usize..cstart[p + 1] as usize];
+        if ck.len() > 1 {
+            ck.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        }
         let pkey = pkeys[p];
         let mut lo = 0usize;
         let mut hi = 0usize;
 
         let mut cur_day: i64 = i64::MIN;
         let (mut us, mut ue, mut ur) = (0u64, 0u64, 0u64);
-        let flush = |day: i64,
-                     us: u64,
-                     ue: u64,
-                     ur: u64,
-                     touched: &mut Vec<u16>,
-                     catsum: &mut Vec<u64>,
-                     users: &mut Vec<URow>| {
+        let flush = |day: i64, us: u64, ue: u64, ur: u64, touched: &mut Vec<u16>, catsum: &mut Vec<u64>, users: &mut Vec<URow>| {
             let mut top: Option<u16> = None;
             for &c in touched.iter() {
                 top = match top {
@@ -1284,7 +1371,7 @@ fn person_bucket(
             let day = s.div_euclid(DAY_MS);
             if day != cur_day {
                 if cur_day != i64::MIN {
-                    flush(cur_day, us, ue, ur, &mut touched, &mut catsum, &mut users);
+                    flush(cur_day, us, ue, ur, touched, catsum, users);
                 }
                 cur_day = day;
                 us = 0;
@@ -1297,12 +1384,12 @@ fn person_bucket(
                 let e = ev[k];
                 last = e.0 as i64;
                 nev += 1;
-                if e.4 == 3 {
+                if e.3 == 3 {
                     purch = true;
                     rev += e.1 as u64;
-                    let c = e.3 as usize;
+                    let c = e.2 as usize;
                     if catsum[c] == 0 {
-                        touched.push(e.3);
+                        touched.push(e.2);
                     }
                     catsum[c] += e.1 as u64;
                 }
@@ -1313,11 +1400,11 @@ fn person_bucket(
             ur += rev;
 
             while hi < ck.len() && ck[hi].0 <= s {
-                add(ck[hi].2, &mut cnt, &mut apos, &mut active);
+                add(ck[hi].2, cnt, apos, active);
                 hi += 1;
             }
             while lo < hi && ck[lo].0 < s - WEEK_MS {
-                remove(ck[lo].2, &mut cnt, &mut apos, &mut active);
+                remove(ck[lo].2, cnt, apos, active);
                 lo += 1;
             }
             let d = (day - ctx.day0) as usize;
@@ -1337,19 +1424,18 @@ fn person_bucket(
                 a[1] += 1;
             }
             a[2] += rev;
-            for &c in &active {
+            for &c in active.iter() {
                 camp_agg[c as usize * nd + d][3] += 1;
             }
         }
         if cur_day != i64::MIN {
-            flush(cur_day, us, ue, ur, &mut touched, &mut catsum, &mut users);
+            flush(cur_day, us, ue, ur, touched, catsum, users);
         }
         while lo < hi {
-            remove(ck[lo].2, &mut cnt, &mut apos, &mut active);
+            remove(ck[lo].2, cnt, apos, active);
             lo += 1;
         }
     }
-    (users, camp_agg)
 }
 
 // ---------------------------------------------------------------- parquet
