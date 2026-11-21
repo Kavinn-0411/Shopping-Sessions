@@ -1015,10 +1015,17 @@ const DEMPTY: DRec = DRec { key: 0, ingest: 0, rec: 0 };
 struct PRec {
     pkey: u64,
     ts: u32, // ms since window start
-    price: u32,
+    rk: u32, // record id << 2 | kind (1 view, 2 cart)
+}
+
+/// A valid purchase, routed by person (only purchases need price and category).
+#[derive(Clone, Copy)]
+struct PurRec {
+    pkey: u64,
+    ts: u32,
     rec: u32,
+    price: u32,
     cat: u16,
-    kind: u8,
 }
 
 /// A valid click, routed by person.
@@ -1380,7 +1387,7 @@ fn run() -> Res<()> {
         // a record line holds at least 27 bytes plus its newline
         next += (t.b - t.a) / 20 + 2;
     }
-    if next > u32::MAX as u64 {
+    if next >= 1 << 30 {
         return Err("too many records".into());
     }
     let nrec = next as usize;
@@ -1485,6 +1492,7 @@ fn run() -> Res<()> {
 struct EvOut {
     dedup: Vec<Vec<DRec>>,
     person: Vec<Vec<PRec>>,
+    pur: Vec<Vec<PurRec>>,
     long: Vec<(u64, B)>,
 }
 
@@ -1555,30 +1563,47 @@ impl<T: Copy, const W: usize> Wc<T, W> {
 }
 
 const WC: usize = 8;
-const PZERO: PRec = PRec { pkey: 0, ts: 0, price: 0, rec: 0, cat: 0, kind: 0 };
+const PZERO: PRec = PRec { pkey: 0, ts: 0, rk: 0 };
 
 #[inline(always)]
-fn flush_events(pend: &[Pend], ctx: &Ctx, person: &mut Wc<PRec, WC>, long: &mut Vec<(u64, B)>) {
+fn flush_events(pend: &[Pend], ctx: &Ctx, person: &mut Wc<PRec, WC>, pur: &mut [Vec<PurRec>], long: &mut Vec<(u64, B)>) {
     for p in pend {
         let pkey = ctx.link.person(p.ukey);
         if pkey == p.ukey && is_long(pkey) {
             long.push((pkey, p.user));
         }
-        person.push((mix(pkey) >> (64 - PBITS)) as usize, PRec {
-            pkey,
-            ts: p.ts,
-            price: p.price,
-            rec: p.rec,
-            cat: p.cat,
-            kind: p.kind,
-        });
+        let b = (mix(pkey) >> (64 - PBITS)) as usize;
+        if p.kind == 3 {
+            pur[b].push(PurRec { pkey, ts: p.ts, rec: p.rec, price: p.price, cat: p.cat });
+        } else {
+            person.push(b, PRec { pkey, ts: p.ts, rk: p.rec << 2 | p.kind as u32 });
+        }
     }
 }
 
+/// Lines per byte near the start of a task (from a small sample), for sizing its buckets.
+fn line_density(files: &[SrcFile], t: &Task) -> f64 {
+    let n = ((t.b - t.a) as usize).min(64 << 10);
+    let mut buf = vec![0u8; n];
+    let got = File::open(&files[t.file].path).ok().and_then(|f| read_full(&f, &mut buf, t.a).ok()).unwrap_or(0);
+    let lines = memchr_iter(b'\n', &buf[..got]).count();
+    if got < 4096 || lines < 16 {
+        1.0 / 40.0
+    } else {
+        lines as f64 / got as f64
+    }
+}
+
+/// Capacity for a bucket expected to hold `m` records (mean plus a few standard deviations).
+fn bucket_cap(m: f64) -> usize {
+    (m + 4.0 * m.sqrt()) as usize + 16
+}
+
 fn parse_events(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<EvOut> {
-    let est = ((t.b - t.a) / 70) as usize + 16;
-    let mut dedup: Wc<DRec, WC> = Wc::new(NE, est / NE + est / NE / 4 + 16, DEMPTY);
-    let mut person: Wc<PRec, WC> = Wc::new(NP, est / NP + est / NP / 4 + 16, PZERO);
+    let est = (t.b - t.a) as f64 * line_density(files, t);
+    let mut dedup: Wc<DRec, WC> = Wc::new(NE, bucket_cap(est / NE as f64), DEMPTY);
+    let mut person: Wc<PRec, WC> = Wc::new(NP, bucket_cap(est * 0.85 / NP as f64), PZERO);
+    let mut pur: Vec<Vec<PurRec>> = (0..NP).map(|_| Vec::with_capacity(bucket_cap(est * 0.035 / NP as f64))).collect();
     let mut long = Vec::new();
     let mut rec = t.base;
     let mut pend = [Pend { ukey: 0, user: &[], ts: 0, price: 0, rec: 0, cat: 0, kind: 0 }; BATCH];
@@ -1625,7 +1650,7 @@ fn parse_events(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<EvOut> {
         if ingest.saturating_sub(t) > LATE_MS {
             return;
         }
-        let cat = ctx.product.get(f[5]).unwrap_or(ctx.unknown);
+        let cat = if kind == 3 { ctx.product.get(f[5]).unwrap_or(ctx.unknown) } else { 0 };
         let ukey = key_of(user);
         ctx.link.prefetch(ukey);
         // long ids keep their bytes (the read buffer is reused)
@@ -1633,18 +1658,18 @@ fn parse_events(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<EvOut> {
         pend[np] = Pend { ukey, user, ts: (t - ctx.ws) as u32, price, rec: r, cat, kind };
         np += 1;
         if np == BATCH {
-            flush_events(&pend, ctx, &mut person, &mut long);
+            flush_events(&pend, ctx, &mut person, &mut pur, &mut long);
             np = 0;
         }
     };
     read_task(files, t, |piece| scan::<7>(&Chunk { data: piece, skip_first: false, base: 0 }, &mut on_line))?;
-    flush_events(&pend[..np], ctx, &mut person, &mut long);
-    Ok(EvOut { dedup: dedup.finish(), person: person.finish(), long })
+    flush_events(&pend[..np], ctx, &mut person, &mut pur, &mut long);
+    Ok(EvOut { dedup: dedup.finish(), person: person.finish(), pur, long })
 }
 
 fn parse_clicks(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<(Vec<Vec<CRec>>, Vec<(u64, B)>)> {
-    let est = ((t.b - t.a) / 40) as usize + 16;
-    let mut out: Vec<Vec<CRec>> = (0..NP).map(|_| Vec::with_capacity(est / NP + est / NP / 4 + 4)).collect();
+    let est = (t.b - t.a) as f64 * line_density(files, t);
+    let mut out: Vec<Vec<CRec>> = (0..NP).map(|_| Vec::with_capacity(bucket_cap(est * 0.9 / NP as f64))).collect();
     let mut long = Vec::new();
     let lo = ctx.ws - WEEK_MS;
     let mut pend: [(u64, u64, i64, u32); BATCH] = [(0, 0, 0, 0); BATCH];
@@ -1833,6 +1858,19 @@ fn person_bucket(
     ids.clear();
     for p in parsed {
         for e in &p.person[b] {
+            if !is_winner(winners, e.rk >> 2) {
+                ids.push(NONE);
+                continue;
+            }
+            let id = *pid_of.entry(e.pkey).or_insert_with(|| {
+                pkeys.push(e.pkey);
+                (pkeys.len() - 1) as u32
+            });
+            ids.push(id);
+        }
+    }
+    for p in parsed {
+        for e in &p.pur[b] {
             if !is_winner(winners, e.rec) {
                 ids.push(NONE);
                 continue;
@@ -1855,7 +1893,18 @@ fn person_bucket(
             x += 1;
             if id != NONE {
                 let at = &mut fill[id as usize];
-                evs[*at as usize] = (e.ts, e.price, e.cat, e.kind);
+                evs[*at as usize] = (e.ts, 0, 0, (e.rk & 3) as u8);
+                *at += 1;
+            }
+        }
+    }
+    for p in parsed {
+        for e in &p.pur[b] {
+            let id = ids[x];
+            x += 1;
+            if id != NONE {
+                let at = &mut fill[id as usize];
+                evs[*at as usize] = (e.ts, e.price, e.cat, 3);
                 *at += 1;
             }
         }
