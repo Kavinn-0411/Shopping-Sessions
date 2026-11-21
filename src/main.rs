@@ -230,6 +230,8 @@ const PBITS: u32 = 8;
 const NP: usize = 1 << PBITS; // person buckets
 const SBITS: u32 = 8;
 const NS: usize = 1 << SBITS; // link map shards
+/// Threads of the separate pool that builds the links while the main pool parses.
+const LINK_THREADS: usize = 2;
 
 type B = &'static [u8];
 type Res<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -1053,6 +1055,9 @@ struct LinkMap {
 }
 
 impl LinkMap {
+    fn empty() -> Self {
+        LinkMap { slots: vec![(0, 0); NS], rbits: 0 }
+    }
     #[inline(always)]
     fn home(&self, k: u64) -> (usize, usize, usize) {
         let h = mix(k);
@@ -1094,7 +1099,8 @@ struct Ctx {
     cat_rank: Vec<u16>,
     camp: IdLookup<u32>,
     ncamp: usize,
-    link: LinkMap,
+    /// Set once the links are built; parsing starts before that and holds records back.
+    link: std::sync::OnceLock<LinkMap>,
     day0: i64,
     nd: usize,
 }
@@ -1309,25 +1315,11 @@ fn run() -> Res<()> {
         return Err("window longer than 49 days is not supported".into());
     }
 
-    // Map all inputs and build lookups concurrently with the links.
-    let (links_res, (lookups, files)) = rayon::join(
-        || build_links(&data, ncpu),
-        || {
-            rayon::join(
-                || -> Res<_> {
-                    Ok((
-                        load_lookup(&data.join("products.csv"))?,
-                        load_lookup(&data.join("campaigns.csv"))?,
-                    ))
-                },
-                || -> Res<_> { Ok((list_src(&data.join("events"))?, list_src(&data.join("clicks"))?)) },
-            )
-        },
-    );
-    let (link, long_link) = links_res?;
-    let (products, campaigns) = lookups?;
-    let (ev_files, ck_files) = files?;
-    eprintln!("[{:?}] links + lookups", t0.elapsed());
+    let products = load_lookup(&data.join("products.csv"))?;
+    let campaigns = load_lookup(&data.join("campaigns.csv"))?;
+    let ev_files = list_src(&data.join("events"))?;
+    let ck_files = list_src(&data.join("clicks"))?;
+    eprintln!("[{:?}] lookups", t0.elapsed());
 
     // products / categories
     let mut cat_names: Vec<B> = Vec::new();
@@ -1374,7 +1366,7 @@ fn run() -> Res<()> {
         cat_rank,
         camp,
         ncamp,
-        link,
+        link: std::sync::OnceLock::new(),
         day0,
         nd,
     });
@@ -1393,11 +1385,36 @@ fn run() -> Res<()> {
     let nrec = next as usize;
     let ck_tasks = make_tasks(&ck_files, task_target(&ck_files, ncpu));
 
-    // ---- parse events and clicks
-    let (parsed, clicks) = rayon::join(
-        || ev_tasks.par_iter().map(|t| parse_events(&ev_files, t, &ctx)).collect::<Res<Vec<_>>>(),
-        || ck_tasks.par_iter().map(|t| parse_clicks(&ck_files, t, &ctx)).collect::<Res<Vec<_>>>(),
-    );
+    // ---- build the links while parsing events and clicks
+    // The links are built from their own thread (its parallel parts run in the pool), so no
+    // pool worker ever waits for the links inside a frame the links need.
+    let (links_res, (parsed, clicks)) = std::thread::scope(|sc| {
+        let (data, ctx) = (&data, &ctx);
+        let h = sc.spawn(move || {
+            let r: Res<_> = match rayon::ThreadPoolBuilder::new().num_threads(LINK_THREADS).build() {
+                Ok(lp) => lp.install(|| build_links(data, LINK_THREADS)),
+                Err(e) => Err(e.into()),
+            };
+            match r {
+            Ok((l, long_link)) => {
+                let _ = ctx.link.set(l);
+                eprintln!("[{:?}] links ready", t0.elapsed());
+                Ok(long_link)
+            }
+            Err(e) => {
+                // let waiting parse tasks finish; the error is returned below
+                let _ = ctx.link.set(LinkMap::empty());
+                Err(e.to_string())
+            }
+            }
+        });
+        let pc = rayon::join(
+            || ev_tasks.par_iter().map(|t| parse_events(&ev_files, t, &ctx)).collect::<Res<Vec<_>>>(),
+            || ck_tasks.par_iter().map(|t| parse_clicks(&ck_files, t, &ctx)).collect::<Res<Vec<_>>>(),
+        );
+        (h.join().unwrap(), pc)
+    });
+    let long_link = links_res.map_err(|e| -> Box<dyn Error + Send + Sync> { e.into() })?;
     let (parsed, clicks) = (parsed?, clicks?);
     let mut lcid: FxHashMap<u64, B> = FxHashMap::default();
     let clicks: Vec<Vec<Vec<CRec>>> = clicks
@@ -1566,9 +1583,9 @@ const WC: usize = 8;
 const PZERO: PRec = PRec { pkey: 0, ts: 0, rk: 0 };
 
 #[inline(always)]
-fn flush_events(pend: &[Pend], ctx: &Ctx, person: &mut Wc<PRec, WC>, pur: &mut [Vec<PurRec>], long: &mut Vec<(u64, B)>) {
+fn flush_events(pend: &[Pend], link: &LinkMap, person: &mut Wc<PRec, WC>, pur: &mut [Vec<PurRec>], long: &mut Vec<(u64, B)>) {
     for p in pend {
-        let pkey = ctx.link.person(p.ukey);
+        let pkey = link.person(p.ukey);
         if pkey == p.ukey && is_long(pkey) {
             long.push((pkey, p.user));
         }
@@ -1599,6 +1616,18 @@ fn bucket_cap(m: f64) -> usize {
     (m + 4.0 * m.sqrt()) as usize + 16
 }
 
+/// The link map, waiting (and running other pending work) until it is built.
+fn wait_link(ctx: &Ctx) -> &LinkMap {
+    loop {
+        if let Some(l) = ctx.link.get() {
+            return l;
+        }
+        if rayon::yield_now() != Some(rayon::Yield::Executed) {
+            std::thread::yield_now();
+        }
+    }
+}
+
 fn parse_events(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<EvOut> {
     let est = (t.b - t.a) as f64 * line_density(files, t);
     let mut dedup: Wc<DRec, WC> = Wc::new(NE, bucket_cap(est / NE as f64), DEMPTY);
@@ -1608,6 +1637,8 @@ fn parse_events(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<EvOut> {
     let mut rec = t.base;
     let mut pend = [Pend { ukey: 0, user: &[], ts: 0, price: 0, rec: 0, cat: 0, kind: 0 }; BATCH];
     let mut np = 0usize;
+    let mut link: Option<&LinkMap> = ctx.link.get();
+    let mut backlog: Vec<Pend> = Vec::new();
     let mut on_line = |f: &[&[u8]; 7]| {
         let eid = f[0];
         if eid.is_empty() {
@@ -1652,18 +1683,32 @@ fn parse_events(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<EvOut> {
         }
         let cat = if kind == 3 { ctx.product.get(f[5]).unwrap_or(ctx.unknown) } else { 0 };
         let ukey = key_of(user);
-        ctx.link.prefetch(ukey);
+        if let Some(l) = link {
+            l.prefetch(ukey);
+        }
         // long ids keep their bytes (the read buffer is reused)
         let user: B = if is_long(ukey) { keep(user) } else { &[] };
         pend[np] = Pend { ukey, user, ts: (t - ctx.ws) as u32, price, rec: r, cat, kind };
         np += 1;
         if np == BATCH {
-            flush_events(&pend, ctx, &mut person, &mut pur, &mut long);
+            if link.is_none() {
+                link = ctx.link.get();
+                if let Some(l) = link {
+                    flush_events(&backlog, l, &mut person, &mut pur, &mut long);
+                    backlog = Vec::new();
+                }
+            }
+            match link {
+                Some(l) => flush_events(&pend, l, &mut person, &mut pur, &mut long),
+                None => backlog.extend_from_slice(&pend),
+            }
             np = 0;
         }
     };
     read_task(files, t, |piece| scan::<7>(&Chunk { data: piece, skip_first: false, base: 0 }, &mut on_line))?;
-    flush_events(&pend[..np], ctx, &mut person, &mut pur, &mut long);
+    let l = wait_link(ctx);
+    flush_events(&backlog, l, &mut person, &mut pur, &mut long);
+    flush_events(&pend[..np], l, &mut person, &mut pur, &mut long);
     Ok(EvOut { dedup: dedup.finish(), person: person.finish(), pur, long })
 }
 
@@ -1674,9 +1719,11 @@ fn parse_clicks(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<(Vec<Vec<CRec>>, 
     let lo = ctx.ws - WEEK_MS;
     let mut pend: [(u64, u64, i64, u32); BATCH] = [(0, 0, 0, 0); BATCH];
     let mut np = 0usize;
-    let flush = |pend: &[(u64, u64, i64, u32)], out: &mut Vec<Vec<CRec>>| {
+    let mut link: Option<&LinkMap> = ctx.link.get();
+    let mut backlog: Vec<(u64, u64, i64, u32)> = Vec::new();
+    let flush = |pend: &[(u64, u64, i64, u32)], link: &LinkMap, out: &mut Vec<Vec<CRec>>| {
         for &(ukey, cid, ts, camp) in pend {
-            let pkey = ctx.link.person(ukey);
+            let pkey = link.person(ukey);
             out[(mix(pkey) >> (64 - PBITS)) as usize].push(CRec { pkey, cid, ts, camp });
         }
     };
@@ -1695,16 +1742,30 @@ fn parse_clicks(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<(Vec<Vec<CRec>>, 
         if is_long(ck) {
             long.push((ck, keep(cid)));
         }
-        ctx.link.prefetch(ukey);
+        if let Some(l) = link {
+            l.prefetch(ukey);
+        }
         pend[np] = (ukey, ck, ts, camp);
         np += 1;
         if np == BATCH {
-            flush(&pend, &mut out);
+            if link.is_none() {
+                link = ctx.link.get();
+                if let Some(l) = link {
+                    flush(&backlog, l, &mut out);
+                    backlog = Vec::new();
+                }
+            }
+            match link {
+                Some(l) => flush(&pend, l, &mut out),
+                None => backlog.extend_from_slice(&pend),
+            }
             np = 0;
         }
     };
     read_task(files, t, |piece| scan::<4>(&Chunk { data: piece, skip_first: false, base: 0 }, &mut on_line))?;
-    flush(&pend[..np], &mut out);
+    let l = wait_link(ctx);
+    flush(&backlog, l, &mut out);
+    flush(&pend[..np], l, &mut out);
     Ok((out, long))
 }
 
