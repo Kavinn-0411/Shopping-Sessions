@@ -24,6 +24,202 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+// ---------------------------------------------------------------- allocator
+
+/// Large allocations come straight from mmap, 2 MB aligned and marked MADV_HUGEPAGE, so the big
+/// random-access tables sit on transparent huge pages where the kernel allows them (fewer TLB
+/// misses and page faults). Medium ones (the many bucket vectors) are bump-allocated from one
+/// reserved huge-page region and never freed: the process is short-lived and they live almost to
+/// the end anyway. Small ones go to the system allocator.
+mod halloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const MED: usize = 16 << 10;
+    const BIG: usize = 1 << 20;
+    const HUGE: usize = 2 << 20;
+    const PAGE: usize = 4096;
+    const RESERVE: usize = 64 << 30;
+
+    pub struct Alloc;
+
+    static ARENA: AtomicUsize = AtomicUsize::new(0); // base; 1 = unavailable
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    #[inline]
+    fn big(l: &Layout) -> bool {
+        l.size() >= BIG && l.align() <= PAGE
+    }
+    #[inline]
+    fn med(l: &Layout) -> bool {
+        l.size() >= MED && l.size() < BIG && l.align() <= 64
+    }
+    #[inline]
+    fn round(n: usize) -> usize {
+        (n + PAGE - 1) & !(PAGE - 1)
+    }
+    fn off() -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OFF.get_or_init(|| std::env::var_os("NOHUGE").is_some())
+    }
+    fn arena_off() -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OFF.get_or_init(|| std::env::var_os("NOARENA").is_some())
+    }
+    #[inline]
+    fn in_arena(p: *mut u8) -> bool {
+        let b = ARENA.load(Ordering::Relaxed);
+        b > 1 && (p as usize) >= b && (p as usize) < b + RESERVE
+    }
+
+    unsafe fn arena_base() -> usize {
+        let b = ARENA.load(Ordering::Acquire);
+        if b != 0 {
+            return b;
+        }
+        let p = libc::mmap(
+            std::ptr::null_mut(),
+            RESERVE + HUGE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        );
+        let nb = if p == libc::MAP_FAILED {
+            1
+        } else {
+            let a = (p as usize + HUGE - 1) & !(HUGE - 1);
+            if !off() {
+                libc::madvise(a as *mut libc::c_void, RESERVE, libc::MADV_HUGEPAGE);
+            }
+            a
+        };
+        match ARENA.compare_exchange(0, nb, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => nb,
+            Err(cur) => {
+                if nb > 1 {
+                    libc::munmap(p, RESERVE + HUGE);
+                }
+                cur
+            }
+        }
+    }
+
+    unsafe fn arena_alloc(size: usize) -> *mut u8 {
+        if arena_off() {
+            return std::ptr::null_mut();
+        }
+        let b = arena_base();
+        if b <= 1 {
+            return std::ptr::null_mut();
+        }
+        let n = (size + 63) & !63;
+        let o = NEXT.fetch_add(n, Ordering::Relaxed);
+        if o + n > RESERVE {
+            return std::ptr::null_mut();
+        }
+        (b + o) as *mut u8
+    }
+
+    unsafe fn map(size: usize) -> *mut u8 {
+        let len = round(size);
+        let prot = libc::PROT_READ | libc::PROT_WRITE;
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+        if len < HUGE {
+            let p = libc::mmap(std::ptr::null_mut(), len, prot, flags, -1, 0);
+            return if p == libc::MAP_FAILED { std::ptr::null_mut() } else { p as *mut u8 };
+        }
+        let p = libc::mmap(std::ptr::null_mut(), len + HUGE, prot, flags, -1, 0);
+        if p == libc::MAP_FAILED {
+            return std::ptr::null_mut();
+        }
+        let a = p as usize;
+        let start = (a + HUGE - 1) & !(HUGE - 1);
+        if start > a {
+            libc::munmap(p, start - a);
+        }
+        let tail = a + len + HUGE - (start + len);
+        if tail > 0 {
+            libc::munmap((start + len) as *mut libc::c_void, tail);
+        }
+        if !off() {
+            libc::madvise(start as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
+        }
+        start as *mut u8
+    }
+
+    unsafe impl GlobalAlloc for Alloc {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            if big(&l) {
+                map(l.size())
+            } else if med(&l) {
+                let p = arena_alloc(l.size());
+                if p.is_null() {
+                    System.alloc(l)
+                } else {
+                    p
+                }
+            } else {
+                System.alloc(l)
+            }
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            if big(&l) {
+                map(l.size())
+            } else if med(&l) {
+                // arena memory is fresh (never reused), hence zero
+                let p = arena_alloc(l.size());
+                if p.is_null() {
+                    System.alloc_zeroed(l)
+                } else {
+                    p
+                }
+            } else {
+                System.alloc_zeroed(l)
+            }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            if in_arena(p) {
+                return;
+            }
+            if big(&l) {
+                libc::munmap(p as *mut libc::c_void, round(l.size()));
+            } else {
+                System.dealloc(p, l)
+            }
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+            let nl = Layout::from_size_align_unchecked(new, l.align());
+            if !in_arena(p) && !big(&l) && !big(&nl) && !med(&nl) {
+                return System.realloc(p, l, new);
+            }
+            if big(&l) && big(&nl) {
+                let (o, n) = (round(l.size()), round(new));
+                if o == n {
+                    return p;
+                }
+                let q = libc::mremap(p as *mut libc::c_void, o, n, libc::MREMAP_MAYMOVE);
+                if q == libc::MAP_FAILED {
+                    return std::ptr::null_mut();
+                }
+                if n >= HUGE && !off() {
+                    libc::madvise(q, n, libc::MADV_HUGEPAGE);
+                }
+                return q as *mut u8;
+            }
+            let q = self.alloc(nl);
+            if !q.is_null() {
+                std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+                self.dealloc(p, l);
+            }
+            q
+        }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: halloc::Alloc = halloc::Alloc;
+
 const DAY_MS: i64 = 86_400_000;
 const GAP_MS: i64 = 1_800_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
@@ -368,8 +564,13 @@ fn masks64(p: *const u8) -> (u64, u64, u64) {
 }
 
 /// Scan a chunk, calling `on_line` with the N unquoted fields of every well-formed line.
+///
+/// Delimiters come from 64-byte bitmasks. Quotes are checked once per line: a line is well
+/// formed when every field either has no quote or starts and ends with one (length >= 2), and
+/// the line holds no other quotes (its quote count is twice the number of quoted fields).
 #[inline(always)]
 fn scan<const N: usize>(c: &Chunk, mut on_line: impl FnMut(&[B; N])) {
+    debug_assert!(N >= 1 && N <= 8);
     let d = c.data;
     let end = d.len();
     let mut pos = 0;
@@ -382,36 +583,48 @@ fn scan<const N: usize>(c: &Chunk, mut on_line: impl FnMut(&[B; N])) {
     if pos >= end {
         return;
     }
-    let mut fields: [B; N] = [&[]; N];
-    let mut nf = 0usize;
-    let mut bad = false;
-    let mut fs = pos;
-    let mut q_fs: u64 = 0;
-    let mut qb: u64 = 0;
+    let base = d.as_ptr();
+    // byte at i (callers guarantee i < end)
+    let at = |i: usize| unsafe { *base.add(i) };
+    let mut dl = [0usize; 8]; // comma positions of the current line (slot 7 absorbs extras)
+    let mut nf = 0usize; // commas seen in the current line
+    let mut ls = pos; // current line start
+    let mut q_ls: u64 = 0; // quotes before the current line start (counted from `pos`)
+    let mut qb: u64 = 0; // quotes before the current block
     let mut blk = pos;
     let mut buf = [0u8; 64];
-    macro_rules! field {
-        ($p:expr, $qc:expr) => {{
-            let p = $p;
-            let qc = $qc;
-            if !bad {
-                if nf == N {
-                    bad = true;
-                } else if qc == 0 {
-                    fields[nf] = unsafe { d.get_unchecked(fs..p) };
-                    nf += 1;
-                } else if qc == 2 && p - fs >= 2 && d[fs] == b'"' && d[p - 1] == b'"' {
-                    fields[nf] = unsafe { d.get_unchecked(fs + 1..p - 1) };
-                    nf += 1;
-                } else {
-                    bad = true;
+    macro_rules! line {
+        ($p:expr, $q:expr) => {{
+            let p: usize = $p;
+            if nf == N - 1 {
+                let lq: u64 = $q - q_ls;
+                let mut fields: [B; N] = [&[]; N];
+                let mut s = ls;
+                let mut bad = false;
+                let mut nq = 0u64;
+                for i in 0..N {
+                    let e = if i + 1 < N { dl[i] } else { p };
+                    let ne = e > s;
+                    let qs = ne & (at(s.min(end - 1)) == b'"');
+                    let qe = ne & (at(e.max(1) - 1) == b'"');
+                    bad |= qs != qe;
+                    bad |= qs & (e - s < 2);
+                    nq += 2 * qs as u64;
+                    let q = qs as usize;
+                    fields[i] = unsafe { std::slice::from_raw_parts(base.add(s + q), (e - s).saturating_sub(2 * q)) };
+                    s = e + 1;
+                }
+                if !bad && nq == lq {
+                    on_line(&fields);
                 }
             }
+            nf = 0;
+            ls = p + 1;
         }};
     }
     while blk < end {
         let (cm, nl, qt) = if blk + 64 <= end {
-            masks64(unsafe { d.as_ptr().add(blk) })
+            masks64(unsafe { base.add(blk) })
         } else {
             buf = [0u8; 64];
             buf[..end - blk].copy_from_slice(&d[blk..]);
@@ -421,27 +634,21 @@ fn scan<const N: usize>(c: &Chunk, mut on_line: impl FnMut(&[B; N])) {
         while st != 0 {
             let bit = st.trailing_zeros();
             let p = blk + bit as usize;
-            let below = (qt & ((1u64 << bit) - 1)).count_ones() as u64;
-            field!(p, qb + below - q_fs);
             if (nl >> bit) & 1 != 0 {
-                if !bad && nf == N {
-                    on_line(&fields);
-                }
-                nf = 0;
-                bad = false;
+                let q = qb + (qt & ((1u64 << bit) - 1)).count_ones() as u64;
+                line!(p, q);
+                q_ls = q;
+            } else {
+                dl[nf.min(7)] = p;
+                nf += 1;
             }
-            fs = p + 1;
-            q_fs = qb + below;
             st &= st - 1;
         }
         qb += qt.count_ones() as u64;
         blk += 64;
     }
-    if fs < end || nf > 0 {
-        field!(end, qb - q_fs);
-        if !bad && nf == N {
-            on_line(&fields);
-        }
+    if ls < end {
+        line!(end, qb);
     }
 }
 
@@ -1111,6 +1318,12 @@ fn run() -> Res<()> {
         .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM")).map(|l| l.to_string()))
         .unwrap_or_default();
     eprintln!("[{:?}] done: {} user rows; {}", t0.elapsed(), nuser, hwm);
+    if std::env::var_os("STATS").is_some() {
+        let r = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+        for l in r.lines().filter(|l| l.starts_with("AnonHuge") || l.starts_with("Anonymous") || l.starts_with("Rss")) {
+            eprintln!("  {l}");
+        }
+    }
     Ok(())
 }
 
