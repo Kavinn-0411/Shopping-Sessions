@@ -13,6 +13,11 @@ memchr = "2"
 libc = "0.2"
 rayon = "1.10"
 rustc-hash = "2"
+mimalloc = { version = "=0.1.52", default-features = false, optional = true }
+
+[features]
+default = ["mi"]
+mi = ["dep:mimalloc"]
 
 [profile.release]
 opt-level = 3

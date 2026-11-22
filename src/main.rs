@@ -217,8 +217,18 @@ mod halloc {
     }
 }
 
+#[cfg(not(feature = "mi"))]
 #[global_allocator]
 static GLOBAL: halloc::Alloc = halloc::Alloc;
+
+#[cfg(feature = "mi")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "mi")]
+extern "C" {
+    fn mi_option_set(option: i32, value: std::ffi::c_long);
+}
 
 const DAY_MS: i64 = 86_400_000;
 const GAP_MS: i64 = 1_800_000;
@@ -1581,6 +1591,15 @@ fn main() {
 
 fn run() -> Res<()> {
     let t0 = Instant::now();
+    // mimalloc: never return freed memory to the OS (option 15 = purge_delay), so buffers freed
+    // by one stage are reused by the next instead of being faulted in and zeroed again
+    #[cfg(feature = "mi")]
+    if std::env::var_os("MI_DEFAULT").is_none() {
+        unsafe { mi_option_set(15, -1) };
+    }
+    if std::env::var_os("PQDICT").is_some() {
+        pq::DICT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let ncpu: usize = std::env::var("NCPU")

@@ -249,8 +249,21 @@ struct Enc {
     data: Vec<u8>,
 }
 
+/// Dictionary encoding on (PQDICT=1): smaller files, but costs more CPU than it saves.
+pub static DICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn encode(c: &Col) -> Enc {
     let n = c.nvals();
+    let dict_on = DICT.load(std::sync::atomic::Ordering::Relaxed);
+    if c.ptype == BYTE_ARRAY && !dict_on {
+        let mut data = Vec::with_capacity(c.bytes.len() + 4 * n);
+        for i in 0..n {
+            let s = c.str_at(i);
+            data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            data.extend_from_slice(s);
+        }
+        return Enc { ptype: BYTE_ARRAY, dict: None, data };
+    }
     if c.ptype == BYTE_ARRAY {
         let plain_len = c.bytes.len() + 4 * n;
         let mut map: FxHashMap<&[u8], u32> = FxHashMap::default();
@@ -302,6 +315,19 @@ fn encode(c: &Col) -> Enc {
         }
     };
     let plain_len = w * n;
+    if !dict_on {
+        let mut data = Vec::with_capacity(plain_len);
+        if w == 4 {
+            for &x in &c.ints {
+                data.extend_from_slice(&(x as i32).to_le_bytes());
+            }
+        } else {
+            for &x in &c.ints {
+                data.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        return Enc { ptype, dict: None, data };
+    }
     let mut map: FxHashMap<i64, u32> = FxHashMap::default();
     let mut order: Vec<i64> = Vec::new();
     let mut idx: Vec<u32> = Vec::with_capacity(n);
