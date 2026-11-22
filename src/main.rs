@@ -258,9 +258,21 @@ fn fmix(mut h: u64) -> u64 {
     h
 }
 
-#[inline]
+/// Hash for routing and tables: one multiply, so only the HIGH bits are well mixed. Buckets
+/// take the top bits and table slots the bits just below them (`slot`).
+#[inline(always)]
 fn mix(k: u64) -> u64 {
-    fmix(k ^ 0x9E37_79B9_7F4A_7C15)
+    (k ^ (k >> 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// `nbits` bits of `h` just below its top `top` bits.
+#[inline(always)]
+fn slot(h: u64, top: u32, nbits: u32) -> usize {
+    if nbits == 0 {
+        0
+    } else {
+        ((h << top) >> (64 - nbits)) as usize
+    }
 }
 
 /// 6-bit codes for [0-9A-Za-z] in ASCII order (0 = not in the alphabet).
@@ -803,7 +815,6 @@ fn scan<'a, const N: usize>(c: &Chunk<'a>, mut on_line: impl FnMut(&[&'a [u8]; N
         return;
     }
     let base = d.as_ptr();
-    let at = |i: usize| unsafe { *base.add(i) };
     let mut buf = [0u8; 64];
     // masks of the block at b (b <= end); position `end` reads as a newline
     let mut masks_at = |b: usize| -> (u64, u64, u64) {
@@ -824,6 +835,7 @@ fn scan<'a, const N: usize>(c: &Chunk<'a>, mut on_line: impl FnMut(&[&'a [u8]; N
     let mut pcarry: u64 = 0; // inside quotes at the end of the previous block
     let mut blk = pos;
     let mut cur = masks_at(blk);
+    let mut fq: u32 = (cur.2 & 1) as u32; // bit i: field i of the current line starts with a quote
     loop {
         let nb = blk + 64;
         let nxt = if nb <= end { masks_at(nb) } else { (0, 0, 0) };
@@ -852,6 +864,7 @@ fn scan<'a, const N: usize>(c: &Chunk<'a>, mut on_line: impl FnMut(&[&'a [u8]; N
         }
         pcarry = (px >> 63) & !(nl >> 63) & 1;
         let mut vm = (q & px & !sm) | (q & !px & !em) | (px & dm);
+        let qn = (q >> 1) | (nxt.2 << 63); // bit i: a quote at position i + 1
         let mut st = dm;
         while st != 0 {
             let bit = st.trailing_zeros();
@@ -866,7 +879,7 @@ fn scan<'a, const N: usize>(c: &Chunk<'a>, mut on_line: impl FnMut(&[&'a [u8]; N
                     let mut s = ls;
                     for i in 0..N {
                         let e = if i + 1 < N { dl[i] } else { p };
-                        let qd = (e > s && at(s) == b'"') as usize;
+                        let qd = ((fq >> i) & 1) as usize;
                         fields[i] = unsafe { std::slice::from_raw_parts(base.add(s + qd), e - s - 2 * qd) };
                         s = e + 1;
                     }
@@ -874,9 +887,11 @@ fn scan<'a, const N: usize>(c: &Chunk<'a>, mut on_line: impl FnMut(&[&'a [u8]; N
                 }
                 nf = 0;
                 ls = p + 1;
+                fq = ((qn >> bit) & 1) as u32;
             } else {
                 dl[nf.min(7)] = p;
                 nf += 1;
+                fq |= (((qn >> bit) & 1) as u32) << nf.min(7);
             }
             st &= st - 1;
         }
@@ -1352,7 +1367,7 @@ impl LinkMap {
         let h = mix(k);
         let base = ((h >> (64 - SBITS)) as usize) << self.rbits;
         let m = (1usize << self.rbits) - 1;
-        (base, (h as usize) & m, m)
+        (base, slot(h, SBITS, self.rbits), m)
     }
     #[inline(always)]
     fn prefetch(&self, k: u64) {
@@ -1394,6 +1409,8 @@ struct Ctx {
     nd: usize,
     /// Months a ts in [ws - 7 days, we) can name.
     tst: TsTab,
+    /// Months of the usual ingest_ts values (others take the general parser).
+    ingt: TsTab,
 }
 
 fn load_lookup(path: &Path) -> Res<Vec<(B, B)>> {
@@ -1568,7 +1585,7 @@ fn build_links(data: &Path, ncpu: usize) -> Res<(LinkMap, Vec<(u64, B)>)> {
                 continue;
             }
             let k = names[i];
-            let mut j = (mix(k) as usize) & m;
+            let mut j = slot(mix(k), SBITS, rbits);
             while region[j].0 != 0 {
                 j = (j + 1) & m;
             }
@@ -1691,6 +1708,7 @@ fn run() -> Res<()> {
         day0,
         nd,
         tst: TsTab::new(ws - WEEK_MS, we),
+        ingt: TsTab::new(ws - WEEK_MS, we + WEEK_MS),
     });
 
     // ---- tasks; each event task gets a disjoint record-id range
@@ -1855,6 +1873,30 @@ struct EvOut {
     long: Vec<(u64, B)>,
 }
 
+/// `parse_ingest` with a month table for the usual dates (ingest_ts is always valid F1).
+#[inline(always)]
+fn parse_ingest_tab(b: &[u8], tab: &TsTab) -> i64 {
+    if b.len() == 20 {
+        let pre = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let mut first = i64::MIN;
+        for &(p, f, _) in &tab.months {
+            if p == pre {
+                first = f;
+            }
+        }
+        if first != i64::MIN {
+            let n = |i: usize| (b[i].wrapping_sub(b'0')) as i64;
+            let secs = (first + n(8) * 10 + n(9) - 1) * 86_400
+                + (n(11) * 10 + n(12)) * 3600
+                + (n(14) * 10 + n(15)) * 60
+                + n(17) * 10
+                + n(18);
+            return secs * 1000;
+        }
+    }
+    parse_ingest(b)
+}
+
 /// ingest_ts is always valid F1; fall back to the full parser if it is not 20 bytes.
 #[inline(always)]
 fn parse_ingest(b: &[u8]) -> i64 {
@@ -1986,7 +2028,7 @@ fn parse_events(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<EvOut> {
         if eid.is_empty() {
             return;
         }
-        let ingest = parse_ingest(f[3]);
+        let ingest = parse_ingest_tab(f[3], &ctx.ingt);
         let key = key_buf(eid);
         dedup.push((mix(key) >> (64 - EBITS)) as usize, DRec {
             key,
@@ -2131,7 +2173,7 @@ fn dedup_bucket(b: usize, parsed: &[EvOut], winners: &[AtomicU64]) {
         let table = &mut tab[..cap];
         for p in parsed {
             for d in &p.dedup[b] {
-                let mut i = (mix(d.key) as usize) & mask;
+                let mut i = slot(mix(d.key), EBITS, cap.trailing_zeros());
                 loop {
                     let t = &mut table[i];
                     if t.key == 0 {
