@@ -896,6 +896,126 @@ fn d2(b: &[u8], i: usize) -> Option<i64> {
     Some(dig(b[i])? * 10 + dig(b[i + 1])?)
 }
 
+/// The calendar months a timestamp inside a window can name (with a day of slack for offsets):
+/// "YYYY-MM-" as a little-endian u64, the epoch day of the 1st, and the month's length.
+struct TsTab {
+    months: Vec<(u64, i64, i64)>,
+}
+
+impl TsTab {
+    fn new(lo_ms: i64, hi_ms: i64) -> Self {
+        let (d0, d1) = ((lo_ms - DAY_MS).div_euclid(DAY_MS), (hi_ms + DAY_MS).div_euclid(DAY_MS));
+        let mut months: Vec<(u64, i64, i64)> = Vec::new();
+        let (mut y, mut m) = civil_from_days(d0);
+        loop {
+            let first = days_from_civil_slow(y, m, 1);
+            if first > d1 {
+                break;
+            }
+            let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+            let len = days_from_civil_slow(ny, nm, 1) - first;
+            if (0..=9999).contains(&y) {
+                let p = format!("{y:04}-{m:02}-");
+                months.push((u64::from_le_bytes(p.as_bytes().try_into().unwrap()), first, len));
+            }
+            (y, m) = (ny, nm);
+        }
+        TsTab { months }
+    }
+}
+
+fn civil_from_days(z: i64) -> (i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + (m <= 2) as i64, m)
+}
+
+/// Eight ASCII digits (first one most significant), or None.
+#[inline(always)]
+fn digits8(x: u64) -> Option<u64> {
+    const H: u64 = 0xF0F0_F0F0_F0F0_F0F0;
+    const Z: u64 = 0x3030_3030_3030_3030;
+    if (x & H) != Z || (x.wrapping_add(0x0606_0606_0606_0606) & H) != Z {
+        return None;
+    }
+    let mut v = x - Z;
+    v = (v * 10 + (v >> 8)) & 0x00FF_00FF_00FF_00FF;
+    v = (v * 100 + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
+    Some((v * 10_000 + (v >> 32)) & 0xFFFF_FFFF)
+}
+
+/// Parse a ts that must fall in the window `tab` was built for: epoch ms, or None when it is bad
+/// or cannot be in the window. Same rules as `parse_ts` for every ts it accepts.
+#[inline(always)]
+fn parse_ts_win(b: &[u8], tab: &TsTab) -> Option<i64> {
+    let n = b.len();
+    if (n == 20 || n == 25) && b[4] == b'-' {
+        let pre = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let mut hit = None;
+        for &(p, first, len) in &tab.months {
+            if p == pre {
+                hit = Some((first, len));
+            }
+        }
+        let (first, len) = hit?;
+        let (d1, d0) = (b[8].wrapping_sub(b'0') as i64, b[9].wrapping_sub(b'0') as i64);
+        let d = d1 * 10 + d0;
+        // HH:MM:SS at 11..19 (colons at 13 and 16)
+        let x = u64::from_le_bytes(b[11..19].try_into().unwrap());
+        let t = x.wrapping_sub(0x3030_0030_3000_3030);
+        let ok = d1 < 10
+            && d0 < 10
+            && d >= 1
+            && d <= len
+            && b[10] == b'T'
+            && b[13] == b':'
+            && b[16] == b':'
+            && (x & 0xF0F0_00F0_F000_F0F0) == 0x3030_0030_3000_3030
+            && (x.wrapping_add(0x0606_0006_0600_0606) & 0xF0F0_00F0_F000_F0F0) == 0x3030_0030_3000_3030;
+        if !ok {
+            return None;
+        }
+        let g = |i: u32| ((t >> (8 * i)) & 0xFF) as i64;
+        let (h, mi, s) = (g(0) * 10 + g(1), g(3) * 10 + g(4), g(6) * 10 + g(7));
+        if h > 23 || mi > 59 || s > 59 {
+            return None;
+        }
+        let mut secs = (first + d - 1) * 86_400 + h * 3600 + mi * 60 + s;
+        if n == 20 {
+            if b[19] != b'Z' {
+                return None;
+            }
+        } else {
+            let sign = match b[19] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let oh = d2(b, 20)?;
+            if b[22] != b':' {
+                return None;
+            }
+            let om = d2(b, 23)?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            secs -= sign * (oh * 3600 + om * 60);
+        }
+        return Some(secs * 1000);
+    }
+    if n == 13 {
+        let a = digits8(u64::from_le_bytes(b[0..8].try_into().unwrap()))?;
+        let c = digits8(u64::from_le_bytes(b[5..13].try_into().unwrap()))?;
+        return Some((a * 100_000 + c % 100_000) as i64);
+    }
+    parse_ts(b)
+}
+
 /// Parse ts in F1, F2 or F3 to epoch ms. None if bad (F3 overflow included).
 #[inline]
 fn parse_ts(b: &[u8]) -> Option<i64> {
@@ -1103,6 +1223,8 @@ struct Ctx {
     link: std::sync::OnceLock<LinkMap>,
     day0: i64,
     nd: usize,
+    /// Months a ts in [ws - 7 days, we) can name.
+    tst: TsTab,
 }
 
 fn load_lookup(path: &Path) -> Res<Vec<(B, B)>> {
@@ -1390,6 +1512,7 @@ fn run() -> Res<()> {
         link: std::sync::OnceLock::new(),
         day0,
         nd,
+        tst: TsTab::new(ws - WEEK_MS, we),
     });
 
     // ---- tasks; each event task gets a disjoint record-id range
@@ -1699,7 +1822,7 @@ fn parse_events(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<EvOut> {
         if user.is_empty() {
             return;
         }
-        let Some(t) = parse_ts(f[2]) else { return };
+        let Some(t) = parse_ts_win(f[2], &ctx.tst) else { return };
         if t < ctx.ws || t >= ctx.we {
             return;
         }
@@ -1773,7 +1896,7 @@ fn parse_clicks(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<(Vec<Vec<CRec>>, 
         if cid.is_empty() || user.is_empty() {
             return;
         }
-        let Some(ts) = parse_ts(f[3]) else { return };
+        let Some(ts) = parse_ts_win(f[3], &ctx.tst) else { return };
         if ts < lo || ts >= ctx.we {
             return;
         }
