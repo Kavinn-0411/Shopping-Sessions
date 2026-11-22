@@ -773,11 +773,120 @@ fn masks64(p: *const u8) -> (u64, u64, u64) {
 
 /// Scan a chunk, calling `on_line` with the N unquoted fields of every well-formed line.
 ///
+/// Delimiters and quotes come from 64-byte bitmasks, and quotes are checked a block at a time:
+/// a line is well formed when every opening quote starts a field, every closing quote ends one,
+/// and no delimiter lies inside quotes (so a quoted field is `"..."` with no inner quote, length
+/// >= 2, and the line holds no other quotes). The end of the chunk counts as a newline.
+#[inline(always)]
+fn scan<'a, const N: usize>(c: &Chunk<'a>, mut on_line: impl FnMut(&[&'a [u8]; N])) {
+    debug_assert!(N >= 2 && N <= 8);
+    let d = c.data;
+    let end = d.len();
+    let mut pos = 0;
+    if c.skip_first {
+        match memchr(b'\n', d) {
+            Some(i) => pos = i + 1,
+            None => return,
+        }
+    }
+    if pos >= end {
+        return;
+    }
+    let base = d.as_ptr();
+    let at = |i: usize| unsafe { *base.add(i) };
+    let mut buf = [0u8; 64];
+    // masks of the block at b (b <= end); position `end` reads as a newline
+    let mut masks_at = |b: usize| -> (u64, u64, u64) {
+        if b + 64 <= end {
+            masks64(unsafe { base.add(b) })
+        } else {
+            buf = [0u8; 64];
+            buf[..end - b].copy_from_slice(&d[b..]);
+            buf[end - b] = b'\n';
+            masks64(buf.as_ptr())
+        }
+    };
+    let mut dl = [0usize; 8]; // comma positions of the current line (slot 7 absorbs extras)
+    let mut nf = 0usize; // commas seen in the current line
+    let mut ls = pos; // current line start
+    let mut vprev = false; // a quote violation in the current line before this block
+    let mut dcarry: u64 = 1; // the byte before the block is a delimiter (or chunk start)
+    let mut pcarry: u64 = 0; // inside quotes at the end of the previous block
+    let mut blk = pos;
+    let mut cur = masks_at(blk);
+    loop {
+        let nb = blk + 64;
+        let nxt = if nb <= end { masks_at(nb) } else { (0, 0, 0) };
+        let (cm, nl, q) = cur;
+        let dm = cm | nl;
+        let sm = (dm << 1) | dcarry; // field starts
+        let em = (dm >> 1) | ((nxt.0 | nxt.1) << 63); // field ends
+        dcarry = dm >> 63;
+        // inside-quotes parity, restarted at every newline
+        let mut px = q;
+        px ^= px << 1;
+        px ^= px << 2;
+        px ^= px << 4;
+        px ^= px << 8;
+        px ^= px << 16;
+        px ^= px << 32;
+        if pcarry != 0 {
+            px = !px;
+        }
+        let mut x = px & nl;
+        while x != 0 {
+            let b = x.trailing_zeros();
+            let flip = if b == 63 { 0 } else { !0u64 << (b + 1) };
+            px ^= flip;
+            x = px & nl & flip;
+        }
+        pcarry = (px >> 63) & !(nl >> 63) & 1;
+        let mut vm = (q & px & !sm) | (q & !px & !em) | (px & dm);
+        let mut st = dm;
+        while st != 0 {
+            let bit = st.trailing_zeros();
+            let p = blk + bit as usize;
+            if (nl >> bit) & 1 != 0 {
+                let upto = if bit == 63 { !0u64 } else { (2u64 << bit) - 1 };
+                let bad = vprev | (vm & upto != 0);
+                vm &= !upto;
+                vprev = false;
+                if nf == N - 1 && !bad {
+                    let mut fields: [&'a [u8]; N] = [&[]; N];
+                    let mut s = ls;
+                    for i in 0..N {
+                        let e = if i + 1 < N { dl[i] } else { p };
+                        let qd = (e > s && at(s) == b'"') as usize;
+                        fields[i] = unsafe { std::slice::from_raw_parts(base.add(s + qd), e - s - 2 * qd) };
+                        s = e + 1;
+                    }
+                    on_line(&fields);
+                }
+                nf = 0;
+                ls = p + 1;
+            } else {
+                dl[nf.min(7)] = p;
+                nf += 1;
+            }
+            st &= st - 1;
+        }
+        vprev |= vm != 0;
+        if nb > end {
+            break;
+        }
+        blk = nb;
+        cur = nxt;
+    }
+}
+
+/// The previous scanner (per-field quote checks), kept as a reference for tests.
+#[cfg(test)]
+///
 /// Delimiters come from 64-byte bitmasks. Quotes are checked once per line: a line is well
 /// formed when every field either has no quote or starts and ends with one (length >= 2), and
 /// the line holds no other quotes (its quote count is twice the number of quoted fields).
 #[inline(always)]
-fn scan<'a, const N: usize>(c: &Chunk<'a>, mut on_line: impl FnMut(&[&'a [u8]; N])) {
+fn scan_ref<'a, const N: usize>(c: &Chunk<'a>, mut on_line: impl FnMut(&[&'a [u8]; N])) {
     debug_assert!(N >= 1 && N <= 8);
     let d = c.data;
     let end = d.len();
@@ -2439,5 +2548,64 @@ mod key_tests {
             let s = &buf[..n];
             assert_eq!(key_buf(s), key_of(s), "{:?}", s);
         }
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+    fn run<const N: usize>(data: &[u8], skip: bool) -> (Vec<Vec<Vec<u8>>>, Vec<Vec<Vec<u8>>>) {
+        let c = Chunk { data, skip_first: skip, base: 0 };
+        let mut a = Vec::new();
+        scan::<N>(&c, |f| a.push(f.iter().map(|x| x.to_vec()).collect()));
+        let mut b = Vec::new();
+        scan_ref::<N>(&c, |f| b.push(f.iter().map(|x| x.to_vec()).collect()));
+        (a, b)
+    }
+    #[test]
+    fn scan_matches_reference() {
+        let mut seed: u64 = 987654321;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut total = 0usize;
+        for it in 0..40_000 {
+            let len = (rnd() % 400) as usize;
+            let mode = it % 4;
+            let mut v = Vec::with_capacity(len);
+            while v.len() < len {
+                let r = rnd() % 100;
+                // mostly well-formed fields, sometimes junk
+                if mode != 0 && r < 60 {
+                    let q = rnd() % 5 == 0;
+                    let fl = (rnd() % 6) as usize;
+                    if q {
+                        v.push(b'"');
+                    }
+                    for _ in 0..fl {
+                        v.push(b"xyz12 "[(rnd() % 6) as usize]);
+                    }
+                    if q {
+                        v.push(b'"');
+                    }
+                    v.push(if rnd() % 7 == 0 { b'\n' } else { b',' });
+                } else {
+                    v.push(b"ab\",\n\"\n,"[(rnd() % 8) as usize]);
+                }
+            }
+            v.truncate(len);
+            let skip = rnd() % 5 == 0;
+            let (a, b) = run::<2>(&v, skip);
+            assert_eq!(a, b, "N=2 {:?}", String::from_utf8_lossy(&v));
+            let (a, b) = run::<4>(&v, skip);
+            assert_eq!(a, b, "N=4 {:?}", String::from_utf8_lossy(&v));
+            let (a, b) = run::<7>(&v, skip);
+            assert_eq!(a, b, "N=7 {:?}", String::from_utf8_lossy(&v));
+            total += a.len();
+        }
+        assert!(total > 5_000, "{total}");
     }
 }
