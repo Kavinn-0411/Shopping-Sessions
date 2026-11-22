@@ -344,6 +344,56 @@ fn key_fast(s: &[u8], _limit: usize) -> u64 {
     key_of(s)
 }
 
+/// `key_of` for a field inside a read buffer: at least 16 bytes must be readable from the
+/// field's start (read buffers keep 64 spare bytes after their data).
+#[inline(always)]
+fn key_buf(s: &[u8]) -> u64 {
+    let n = s.len();
+    if n == 0 {
+        return 0;
+    }
+    if n > MAXPACK {
+        return hashed_key(s);
+    }
+    #[cfg(target_feature = "avx2")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let x = _mm_loadu_si128(s.as_ptr() as *const __m128i);
+        // unsigned x - lo <= span
+        let range = |lo: u8, span: u8| -> (__m128i, __m128i) {
+            let t = _mm_sub_epi8(x, _mm_set1_epi8(lo as i8));
+            (_mm_cmpeq_epi8(_mm_min_epu8(t, _mm_set1_epi8(span as i8)), t), t)
+        };
+        let (d, td) = range(b'0', 9);
+        let (u, tu) = range(b'A', 25);
+        let (l, tl) = range(b'a', 25);
+        let ok = _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(d, u), l)) as u32;
+        let want = (1u32 << n) - 1;
+        if ok & want != want {
+            return hashed_key(s);
+        }
+        let iota = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let inlen = _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), iota);
+        let code = _mm_or_si128(
+            _mm_or_si128(
+                _mm_and_si128(d, _mm_add_epi8(td, _mm_set1_epi8(1))),
+                _mm_and_si128(u, _mm_add_epi8(tu, _mm_set1_epi8(11))),
+            ),
+            _mm_and_si128(l, _mm_add_epi8(tl, _mm_set1_epi8(37))),
+        );
+        let code = _mm_and_si128(code, inlen);
+        // pairs: c0*64 + c1, ...; then quads: p0*4096 + p1, ...
+        let p = _mm_maddubs_epi16(code, _mm_set1_epi16(0x0140));
+        let q = _mm_madd_epi16(p, _mm_set1_epi32(0x0001_1000));
+        let q0 = _mm_cvtsi128_si32(q) as u32 as u64;
+        let q1 = _mm_extract_epi32::<1>(q) as u32 as u64;
+        let q2 = _mm_extract_epi32::<2>(q) as u32 as u64;
+        return (q0 << 36) | (q1 << 12) | (q2 >> 12);
+    }
+    #[allow(unreachable_code)]
+    key_of(s)
+}
+
 /// Lookup for IDs like `p123` / `c_45`: a direct array for `<prefix><digits, no leading zero>`,
 /// exact KeyMap fallback for every other string.
 struct IdLookup<V: Copy> {
@@ -569,8 +619,8 @@ fn read_task(files: &[SrcFile], t: &Task, mut f: impl FnMut(&[u8])) -> Res<()> {
         let mut skipping = true;
         let mut carry = 0usize;
         loop {
-            if buf.len() < carry + PIECE {
-                buf.resize(carry + PIECE, 0);
+            if buf.len() < carry + PIECE + 64 {
+                buf.resize(carry + PIECE + 64, 0);
             }
             let n = read_full(&file, &mut buf[carry..carry + PIECE], off)?;
             let base = off - carry as u64; // file offset of buf[0]
@@ -1280,8 +1330,8 @@ fn build_links(data: &Path, ncpu: usize) -> Res<(LinkMap, Vec<(u64, B)>)> {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
-                let a = key_of(f[0]);
-                let b = key_of(f[1]);
+                let a = key_buf(f[0]);
+                let b = key_buf(f[1]);
                 if is_long(a) {
                     long.push((a, keep(f[0])));
                 }
@@ -1809,7 +1859,7 @@ fn parse_events(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<EvOut> {
             return;
         }
         let ingest = parse_ingest(f[3]);
-        let key = key_of(eid);
+        let key = key_buf(eid);
         dedup.push((mix(key) >> (64 - EBITS)) as usize, DRec {
             key,
             ingest: (ingest / 1000).clamp(0, u32::MAX as i64) as u32,
@@ -1846,7 +1896,7 @@ fn parse_events(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<EvOut> {
             return;
         }
         let cat = if kind == 3 { ctx.product.get(f[5]).unwrap_or(ctx.unknown) } else { 0 };
-        let ukey = key_of(user);
+        let ukey = key_buf(user);
         if let Some(l) = link {
             l.prefetch(ukey);
         }
@@ -1901,8 +1951,8 @@ fn parse_clicks(files: &[SrcFile], t: &Task, ctx: &Ctx) -> Res<(Vec<Vec<CRec>>, 
             return;
         }
         let Some(camp) = ctx.camp.get(f[2]) else { return };
-        let ukey = key_of(user);
-        let ck = key_of(cid);
+        let ukey = key_buf(user);
+        let ck = key_buf(cid);
         if is_long(ck) {
             long.push((ck, keep(cid)));
         }
@@ -2361,4 +2411,33 @@ fn write_campaigns(path: &Path, agg: &[[u64; 4]], ids: &[B], ch: &[B], day0: i64
     }
     pq::write(path, &[cid, chn, day, ses, pur, rev, ast], n)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    #[test]
+    fn key_buf_matches_key_of() {
+        let alpha: Vec<u8> = (0u8..=255).collect();
+        let mut seed: u64 = 12345;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut buf = vec![0u8; 64];
+        for it in 0..2_000_000 {
+            let n = (rnd() % 13) as usize;
+            for b in buf.iter_mut() {
+                let r = rnd();
+                *b = if it % 3 == 0 { alpha[(r % 256) as usize] } else { b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"[(r % 62) as usize] };
+                if r % 97 == 0 {
+                    *b = b"/:@[`{ \"_-"[(r % 10) as usize];
+                }
+            }
+            let s = &buf[..n];
+            assert_eq!(key_buf(s), key_of(s), "{:?}", s);
+        }
+    }
 }
