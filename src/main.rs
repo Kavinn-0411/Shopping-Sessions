@@ -1409,7 +1409,27 @@ fn run() -> Res<()> {
     // ---- build the links while parsing events and clicks
     // The links are built from their own thread (its parallel parts run in the pool), so no
     // pool worker ever waits for the links inside a frame the links need.
-    let (links_res, (parsed, clicks)) = std::thread::scope(|sc| {
+    // On few physical cores (the scorer has 4 cores / 8 hyperthreads) building the links first
+    // with every thread beats overlapping them with parsing; OVERLAP=1 selects the overlap.
+    let overlap = std::env::var_os("OVERLAP").is_some();
+    let (links_res, (parsed, clicks)) = if !overlap {
+        let r = match build_links(&data, ncpu) {
+            Ok((l, long_link)) => {
+                let _ = ctx.link.set(l);
+                eprintln!("[{:?}] links ready", t0.elapsed());
+                Ok(long_link)
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        if r.is_err() {
+            return Err(r.unwrap_err().into());
+        }
+        let pc = rayon::join(
+            || ev_tasks.par_iter().map(|t| parse_events(&ev_files, t, &ctx)).collect::<Res<Vec<_>>>(),
+            || ck_tasks.par_iter().map(|t| parse_clicks(&ck_files, t, &ctx)).collect::<Res<Vec<_>>>(),
+        );
+        (r, pc)
+    } else { std::thread::scope(|sc| {
         let (data, ctx) = (&data, &ctx);
         let h = sc.spawn(move || {
             let r: Res<_> = match rayon::ThreadPoolBuilder::new().num_threads(LINK_THREADS).build() {
@@ -1434,7 +1454,7 @@ fn run() -> Res<()> {
             || ck_tasks.par_iter().map(|t| parse_clicks(&ck_files, t, &ctx)).collect::<Res<Vec<_>>>(),
         );
         (h.join().unwrap(), pc)
-    });
+    }) };
     let long_link = links_res.map_err(|e| -> Box<dyn Error + Send + Sync> { e.into() })?;
     let (parsed, clicks) = (parsed?, clicks?);
     let mut lcid: FxHashMap<u64, B> = FxHashMap::default();
